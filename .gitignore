@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Runtime terminal artifacts (PTY scrollback logs, id counter)
+terminals/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -10,7 +10,7 @@
   --toolbar-bg: #2d2d2d;
   --pane-header-bg: #2d2d2d;
   --tile-border: #343434;
-  --tile-border-active: #4ec9b0;
+  --tile-border-active: #6e6e6e;
   --tile-border-target: #c7a64a;
   --divider: rgba(255, 255, 255, 0.06);
 }
@@ -50,11 +50,34 @@ body,
   border-bottom: 1px solid var(--sidebar-border);
 }
 
-.sidebar-title {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--text-dim);
+.sidebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.brand-lockup {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.brand-logo {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex: 0 0 auto;
+}
+
+.brand-title {
+  color: #e5e5e5;
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .new-btn {
@@ -75,6 +98,15 @@ body,
 
 .new-btn:hover {
   background: var(--accent-hover);
+}
+
+.new-btn.linked {
+  background: #3a3a3a;
+  font-size: 13px;
+}
+
+.new-btn.linked:hover {
+  background: #4a4a4a;
 }
 
 .session-list {
@@ -120,11 +152,27 @@ body,
   flex-shrink: 0;
 }
 
+.session-dot.linked {
+  background: #c7a64a;
+}
+
 .session-name {
   flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-rename-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: #1e1e1e;
+  color: var(--text);
+  font: inherit;
+  padding: 1px 4px;
+  outline: none;
 }
 
 .session-count {
@@ -195,6 +243,36 @@ body,
 .tool-btn:hover {
   background: #3f3f46;
   border-color: var(--accent);
+}
+
+.toolbar-spacer {
+  flex: 1 1 auto;
+}
+
+.font-size-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.font-btn {
+  min-width: 24px;
+  padding: 2px 6px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+.font-btn.reset {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
+.font-size-label {
+  min-width: 22px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
 }
 
 .session-stage {
@@ -363,6 +441,52 @@ body,
   flex: 1 1 auto;
 }
 
+.pane-ai-shortcuts {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  margin-right: 2px;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.pane-cell:hover .pane-ai-shortcuts,
+.pane-cell.active .pane-ai-shortcuts {
+  opacity: 1;
+}
+
+.pane-ai-btn {
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.pane-ai-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.pane-ai-icon {
+  width: 13px;
+  height: 13px;
+  pointer-events: none;
+}
+
+.pane-ai-badge {
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
 .pane-close {
   width: 16px;
   height: 16px;
@@ -408,6 +532,7 @@ body,
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 10px;
 }
 
 .empty-btn {

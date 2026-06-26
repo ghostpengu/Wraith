@@ -5,6 +5,7 @@ use std::thread;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
+use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 struct PtyInstance {
@@ -38,11 +39,17 @@ fn kill_instance(id: &str, state: &AppState) {
 }
 
 fn kill_all(state: &AppState) {
-    if let Some(mut map) = state.pty.lock().ok() {
-        for (_id, mut instance) in map.drain() {
-            instance.kill_flag.store(true, Ordering::SeqCst);
+    let instances: Vec<PtyInstance> = if let Ok(mut map) = state.pty.lock() {
+        map.drain().map(|(_, instance)| instance).collect()
+    } else {
+        return;
+    };
+
+    for mut instance in instances {
+        instance.kill_flag.store(true, Ordering::SeqCst);
+        thread::spawn(move || {
             let _ = instance.child.kill();
-        }
+        });
     }
 }
 
@@ -53,7 +60,11 @@ fn new_id() -> String {
 }
 
 #[tauri::command]
-fn spawn_powershell(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+fn spawn_powershell(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    cwd: Option<String>,
+) -> Result<String, String> {
     let pty_system = native_pty_system();
     let pty_pair = pty_system
         .openpty(PtySize {
@@ -66,6 +77,11 @@ fn spawn_powershell(app: AppHandle, state: State<'_, AppState>) -> Result<String
 
     let mut cmd = CommandBuilder::new("powershell.exe");
     cmd.arg("-NoLogo");
+    if let Some(path) = cwd.as_deref() {
+        if !path.trim().is_empty() {
+            cmd.cwd(path);
+        }
+    }
 
     let child = pty_pair
         .slave
@@ -186,17 +202,56 @@ fn list_powershell(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     Ok(slot.keys().cloned().collect())
 }
 
+fn sessions_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_local_data_dir()
+        .map_err(|e| format!("app data dir failed: {e}"))
+        .map(|dir| dir.join("sessions.json"))
+}
+
+#[tauri::command]
+fn load_sessions(app: AppHandle) -> Result<Option<Value>, String> {
+    let path = sessions_path(&app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents =
+        std::fs::read_to_string(&path).map_err(|e| format!("read sessions failed: {e}"))?;
+    let value: Value =
+        serde_json::from_str(&contents).map_err(|e| format!("parse sessions failed: {e}"))?;
+    Ok(Some(value))
+}
+
+#[tauri::command]
+fn save_sessions(app: AppHandle, state: Value) -> Result<(), String> {
+    let path = sessions_path(&app)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| "sessions path has no parent".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create sessions dir failed: {e}"))?;
+
+    let json =
+        serde_json::to_string_pretty(&state).map_err(|e| format!("serialize sessions failed: {e}"))?;
+    let tmp_path = dir.join("sessions.json.tmp");
+    std::fs::write(&tmp_path, json).map_err(|e| format!("write sessions failed: {e}"))?;
+    std::fs::rename(&tmp_path, &path).map_err(|e| format!("commit sessions failed: {e}"))?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             spawn_powershell,
             write_powershell,
             resize_powershell,
             kill_powershell,
-            list_powershell
+            list_powershell,
+            load_sessions,
+            save_sessions
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
