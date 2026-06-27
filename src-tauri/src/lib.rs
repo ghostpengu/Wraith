@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 struct PtyInstance {
@@ -18,6 +21,7 @@ struct PtyInstance {
 #[derive(Default)]
 struct AppState {
     pty: Mutex<HashMap<String, PtyInstance>>,
+    agent_hook_url: Mutex<Option<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -26,12 +30,15 @@ struct PtyOutput {
     data: String,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AgentHookFinished {
+    run_id: String,
+    agent: Option<String>,
+}
+
 fn kill_instance(id: &str, state: &AppState) {
-    let removed = state
-        .pty
-        .lock()
-        .ok()
-        .and_then(|mut map| map.remove(id));
+    let removed = state.pty.lock().ok().and_then(|mut map| map.remove(id));
     if let Some(mut instance) = removed {
         instance.kill_flag.store(true, Ordering::SeqCst);
         let _ = instance.child.kill();
@@ -55,8 +62,300 @@ fn kill_all(state: &AppState) {
 
 fn new_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     format!("pty-{:x}", nanos)
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                output.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &input[i + 1..i + 3];
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    output.push(value);
+                    i += 3;
+                } else {
+                    output.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            value => {
+                output.push(value);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn query_value(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        if percent_decode(name) == key {
+            Some(percent_decode(value))
+        } else {
+            None
+        }
+    })
+}
+
+fn handle_agent_hook_request(mut stream: TcpStream, app: &AppHandle) {
+    let mut buffer = [0u8; 8192];
+    let read = stream.read(&mut buffer).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let mut accepted = false;
+
+    if let Some(request_line) = request.lines().next() {
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default();
+        let target = parts.next().unwrap_or_default();
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+
+        if method == "POST" && path == "/agent-finished" {
+            if let Some(run_id) = query_value(query, "runId").filter(|value| !value.is_empty()) {
+                let payload = AgentHookFinished {
+                    run_id,
+                    agent: query_value(query, "agent").filter(|value| !value.is_empty()),
+                };
+                accepted = app.emit("agent-finished", payload).is_ok();
+            }
+        }
+    }
+
+    let (status, body) = if accepted {
+        ("200 OK", "{}")
+    } else {
+        ("400 Bad Request", r#"{"error":"bad request"}"#)
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn start_agent_hook_server(app: AppHandle) -> Result<String, String> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("hook bind failed: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("hook local addr failed: {e}"))?
+        .port();
+    let url = format!("http://127.0.0.1:{port}/agent-finished");
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            if let Ok(stream) = stream {
+                handle_agent_hook_request(stream, &app);
+            }
+        }
+    });
+
+    Ok(url)
+}
+
+fn user_home() -> Result<PathBuf, String> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .ok_or_else(|| "user home directory not found".to_string())
+}
+
+fn write_json_pretty(path: &Path, value: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
+    }
+    let json =
+        serde_json::to_string_pretty(value).map_err(|e| format!("serialize JSON failed: {e}"))?;
+    std::fs::write(path, format!("{json}\n"))
+        .map_err(|e| format!("write {} failed: {e}", path.display()))
+}
+
+fn load_json_object(path: &Path) -> Result<Value, String> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {} failed: {e}", path.display()))?;
+    let value: Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("parse {} failed: {e}", path.display()))?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(format!("{} must contain a JSON object", path.display()))
+    }
+}
+
+fn ensure_agent_hook_script(home: &Path) -> Result<String, String> {
+    let script_dir = home.join(".wraith");
+    std::fs::create_dir_all(&script_dir)
+        .map_err(|e| format!("create {} failed: {e}", script_dir.display()))?;
+
+    let script_path = script_dir.join("wraith-agent-finished.ps1");
+    let script = r#"$hookUrl = [Environment]::GetEnvironmentVariable('WRAITH_AGENT_HOOK_URL')
+$runId = [Environment]::GetEnvironmentVariable('WRAITH_AGENT_RUN_ID')
+
+if ([string]::IsNullOrWhiteSpace($hookUrl) -or [string]::IsNullOrWhiteSpace($runId)) {
+  exit 0
+}
+
+try {
+  $uriBuilder = [System.UriBuilder]::new($hookUrl)
+  $query = 'runId=' + [System.Uri]::EscapeDataString($runId)
+  $label = [Environment]::GetEnvironmentVariable('WRAITH_AGENT_LABEL')
+  if (-not [string]::IsNullOrWhiteSpace($label)) {
+    $query += '&agent=' + [System.Uri]::EscapeDataString($label)
+  }
+  $uriBuilder.Query = $query
+  Invoke-WebRequest -UseBasicParsing -Method Post -Uri $uriBuilder.Uri.AbsoluteUri -TimeoutSec 2 | Out-Null
+} catch {
+}
+"#;
+    std::fs::write(&script_path, script)
+        .map_err(|e| format!("write {} failed: {e}", script_path.display()))?;
+
+    let escaped_path = script_path.display().to_string().replace('"', "\\\"");
+    Ok(format!(
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{escaped_path}\""
+    ))
+}
+
+fn ensure_stop_hook_json(path: &Path, command: &str) -> Result<(), String> {
+    let mut root = load_json_object(path)?;
+    let root_obj = root
+        .as_object_mut()
+        .ok_or_else(|| format!("{} must contain a JSON object", path.display()))?;
+    let hooks = root_obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or_else(|| "hooks must be a JSON object".to_string())?;
+    let stop = hooks_obj.entry("Stop").or_insert_with(|| json!([]));
+    if !stop.is_array() {
+        *stop = json!([]);
+    }
+
+    let stop_array = stop
+        .as_array_mut()
+        .ok_or_else(|| "Stop hooks must be a JSON array".to_string())?;
+    stop_array.retain(|entry| {
+        let entry = entry.to_string().to_ascii_lowercase();
+        !entry.contains("wraith_agent_hook_url")
+            && !entry.contains("wraith-agent-finished.ps1")
+            && !entry.contains("wraith agent completion notification")
+    });
+    stop_array.push(json!({
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "timeout": 5
+            }
+        ]
+    }));
+
+    write_json_pretty(path, &root)
+}
+
+fn ensure_grok_hook(home: &Path, command: &str) -> Result<(), String> {
+    let path = home
+        .join(".grok")
+        .join("hooks")
+        .join("wraith-finished.json");
+    let value = json!({
+        "description": "Wraith agent completion notification",
+        "hooks": {
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": command,
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    write_json_pretty(&path, &value)
+}
+
+fn ensure_opencode_plugin(home: &Path) -> Result<(), String> {
+    let plugin_dir = home.join(".config").join("opencode").join("plugins");
+    std::fs::create_dir_all(&plugin_dir)
+        .map_err(|e| format!("create {} failed: {e}", plugin_dir.display()))?;
+
+    let path = plugin_dir.join("wraith-notify.js");
+    let source = r#"export const WraithNotifyPlugin = async () => {
+  let lastRunId = "";
+  let lastAt = 0;
+
+  return {
+    event: async ({ event }) => {
+      if (event.type !== "session.idle") return;
+
+      const url = process.env.WRAITH_AGENT_HOOK_URL;
+      const runId = process.env.WRAITH_AGENT_RUN_ID;
+      const agent = process.env.WRAITH_AGENT_LABEL || "opencode";
+      if (!url || !runId) return;
+
+      const now = Date.now();
+      if (runId === lastRunId && now - lastAt < 1000) return;
+      lastRunId = runId;
+      lastAt = now;
+
+      const target = new URL(url);
+      target.searchParams.set("runId", runId);
+      target.searchParams.set("agent", agent);
+      await fetch(target, { method: "POST" }).catch(() => undefined);
+    },
+  };
+};
+"#;
+
+    std::fs::write(&path, source).map_err(|e| format!("write {} failed: {e}", path.display()))
+}
+
+#[tauri::command]
+fn agent_hook_url(state: State<'_, AppState>) -> Result<String, String> {
+    state
+        .agent_hook_url
+        .lock()
+        .map_err(|e| format!("lock poisoned: {e}"))?
+        .clone()
+        .ok_or_else(|| "agent hook server not ready".to_string())
+}
+
+#[tauri::command]
+fn ensure_agent_hooks() -> Result<(), String> {
+    let home = user_home()?;
+    let command = ensure_agent_hook_script(&home)?;
+
+    ensure_stop_hook_json(&home.join(".codex").join("hooks.json"), &command)?;
+    ensure_stop_hook_json(&home.join(".claude").join("settings.json"), &command)?;
+    ensure_grok_hook(&home, &command)?;
+    ensure_opencode_plugin(&home)?;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -230,8 +529,8 @@ fn save_sessions(app: AppHandle, state: Value) -> Result<(), String> {
         .ok_or_else(|| "sessions path has no parent".to_string())?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create sessions dir failed: {e}"))?;
 
-    let json =
-        serde_json::to_string_pretty(&state).map_err(|e| format!("serialize sessions failed: {e}"))?;
+    let json = serde_json::to_string_pretty(&state)
+        .map_err(|e| format!("serialize sessions failed: {e}"))?;
     let tmp_path = dir.join("sessions.json.tmp");
     std::fs::write(&tmp_path, json).map_err(|e| format!("write sessions failed: {e}"))?;
     std::fs::rename(&tmp_path, &path).map_err(|e| format!("commit sessions failed: {e}"))?;
@@ -244,6 +543,15 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .setup(|app| {
+            let url = start_agent_hook_server(app.handle().clone())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let state = app.state::<AppState>();
+            if let Ok(mut slot) = state.agent_hook_url.lock() {
+                *slot = Some(url);
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             spawn_powershell,
             write_powershell,
@@ -251,7 +559,9 @@ pub fn run() {
             kill_powershell,
             list_powershell,
             load_sessions,
-            save_sessions
+            save_sessions,
+            agent_hook_url,
+            ensure_agent_hooks
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

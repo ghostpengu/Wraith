@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import "@xterm/xterm/css/xterm.css";
 import openaiIcon from "./assets/ai-openai.svg";
@@ -14,21 +14,52 @@ import "./App.css";
 
 interface AiShortcut {
   label: string;
-  cmd: string;
+  command: string;
   icon?: string;
   badge?: string;
 }
 
 const AI_SHORTCUTS: AiShortcut[] = [
-  { label: "codex", cmd: "codex\r", icon: openaiIcon },
-  { label: "opencode", cmd: "opencode\r", icon: opencodeIcon },
-  { label: "claude", cmd: "claude\r", icon: claudeIcon },
-  { label: "grok", cmd: "grok\r", badge: "G" },
+  { label: "codex", command: "codex", icon: openaiIcon },
+  { label: "opencode", command: "opencode", icon: opencodeIcon },
+  { label: "claude", command: "claude", icon: claudeIcon },
+  { label: "grok", command: "grok", badge: "G" },
 ];
 
 interface PtyOutputPayload {
   id: string;
   data: string;
+}
+
+interface AgentHookFinishedPayload {
+  runId: string;
+  agent?: string;
+}
+
+interface AgentRun {
+  token: string;
+  label: string;
+  sessionName: string;
+  paneId: string;
+  command: string;
+  echoText: string;
+  echoMatched: number;
+  echoDisplayed: boolean;
+  armed: boolean;
+  notified: boolean;
+}
+
+interface AgentCompletionMarker {
+  token: string;
+  exitCode: number;
+}
+
+interface AgentToast {
+  id: string;
+  label: string;
+  sessionName: string;
+  exitCode: number;
+  status: "success" | "warning";
 }
 
 type SplitDir = "row" | "column";
@@ -109,8 +140,23 @@ const DEFAULT_FONT_SIZE = 13;
 const MIN_FONT_SIZE = 8;
 const MAX_FONT_SIZE = 32;
 const FONT_SIZE_STORAGE_KEY = "wraith:font-size";
+const AGENT_DONE_MARKER = "__WRAITH_AGENT_DONE__";
+const AGENT_TOAST_MS = 5000;
+const AGENT_BLINK_MS = 3000;
+const CONFETTI_PIECES = 28;
+const CONFETTI_COLORS = [
+  "#ffeb00",
+  "#ff4d4d",
+  "#4ec9b0",
+  "#0e639c",
+  "#c7a64a",
+  "#b06ddb",
+  "#56d364",
+  "#ff8c42",
+];
 let splitSerial = 0;
 let paneSerial = 0;
+let agentRunSerial = 0;
 
 function createSplitId() {
   splitSerial += 1;
@@ -120,6 +166,169 @@ function createSplitId() {
 function createPaneId() {
   paneSerial += 1;
   return `pane-${Date.now()}-${paneSerial}`;
+}
+
+function createAgentRunToken() {
+  agentRunSerial += 1;
+  return `run-${Date.now()}-${agentRunSerial}`;
+}
+
+function psSingleQuote(value: string) {
+  return value.replace(/'/g, "''");
+}
+
+function commandWithAgentFlags(command: string, label: string) {
+  const trimmed = command.trim();
+  if (
+    label === "codex" &&
+    /^codex(?:\.exe)?(?:\s|$)/i.test(trimmed) &&
+    !/\s--dangerously-bypass-hook-trust(?:\s|$)/.test(trimmed)
+  ) {
+    return trimmed.replace(
+      /^codex(?:\.exe)?/i,
+      (match) => `${match} --dangerously-bypass-hook-trust`
+    );
+  }
+
+  return trimmed;
+}
+
+function buildAgentCommand(
+  command: string,
+  token: string,
+  hookUrl: string,
+  label: string
+) {
+  const trimmed = commandWithAgentFlags(command, label);
+  const hookEnv =
+    `$env:WRAITH_AGENT_HOOK_URL='${psSingleQuote(hookUrl)}'; ` +
+    `$env:WRAITH_AGENT_RUN_ID='${psSingleQuote(token)}'; ` +
+    `$env:WRAITH_AGENT_LABEL='${psSingleQuote(label)}'; `;
+  const markerExpression =
+    "[string]::Concat('__WRAITH','_AGENT_DONE__',':','" +
+    token +
+    "',':',$wraithExitCode)";
+  const line =
+    "& { " +
+    hookEnv +
+    "$global:LASTEXITCODE = 0; " +
+    trimmed +
+    "; $wraithExitCode = if ($LASTEXITCODE -ne 0) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }; Write-Host (" +
+    markerExpression +
+    ") }";
+
+  return `${line}\r`;
+}
+
+function findIncompleteAgentMarkerStart(value: string) {
+  const markerStart = value.lastIndexOf(AGENT_DONE_MARKER);
+  if (markerStart !== -1 && !/[\r\n]/.test(value.slice(markerStart))) {
+    return markerStart;
+  }
+
+  const maxPrefix = Math.min(value.length, AGENT_DONE_MARKER.length - 1);
+  for (let len = maxPrefix; len > 0; len -= 1) {
+    if (value.endsWith(AGENT_DONE_MARKER.slice(0, len))) {
+      return value.length - len;
+    }
+  }
+
+  return -1;
+}
+
+function splitAgentCompletionMarkers(input: string): {
+  visible: string;
+  markers: AgentCompletionMarker[];
+  tail: string;
+} {
+  const markerPattern = /__WRAITH_AGENT_DONE__:([A-Za-z0-9_-]+):(-?\d+)\r?\n?/g;
+  const markers: AgentCompletionMarker[] = [];
+  let visible = "";
+  let cursor = 0;
+  let match: RegExpExecArray | null = null;
+
+  while ((match = markerPattern.exec(input)) !== null) {
+    visible += input.slice(cursor, match.index);
+    markers.push({
+      token: match[1],
+      exitCode: Number.parseInt(match[2], 10),
+    });
+    cursor = match.index + match[0].length;
+  }
+
+  const remainder = input.slice(cursor);
+  const incompleteStart = findIncompleteAgentMarkerStart(remainder);
+  if (incompleteStart === -1) {
+    return { visible: visible + remainder, markers, tail: "" };
+  }
+
+  return {
+    visible: visible + remainder.slice(0, incompleteStart),
+    markers,
+    tail: remainder.slice(incompleteStart),
+  };
+}
+
+function processAgentRunOutput(run: AgentRun, data: string) {
+  if (run.echoDisplayed || run.echoMatched >= run.echoText.length) {
+    return data;
+  }
+
+  let index = 0;
+  while (index < data.length && run.echoMatched < run.echoText.length) {
+    if (data[index] !== run.echoText[run.echoMatched]) {
+      const suppressed = run.echoText.slice(0, run.echoMatched);
+      run.echoDisplayed = true;
+      run.echoMatched = run.echoText.length;
+      const rest = data.slice(index);
+      return suppressed + rest;
+    }
+    run.echoMatched += 1;
+    index += 1;
+  }
+
+  if (run.echoMatched < run.echoText.length) {
+    return "";
+  }
+
+  run.echoDisplayed = true;
+  const rest = data.slice(index);
+  return run.command + rest;
+}
+
+let completionAudioContext: AudioContext | null = null;
+
+function playAgentCompletionSound(warning: boolean) {
+  const audioWindow = window as Window &
+    typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+  const AudioContextCtor = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
+  if (!AudioContextCtor) return;
+
+  try {
+    completionAudioContext ??= new AudioContextCtor();
+    const ctx = completionAudioContext;
+    void ctx.resume().then(() => {
+      const notes = warning ? [523.25, 392.0] : [659.25, 987.77];
+      notes.forEach((freq, i) => {
+        const now = ctx.currentTime + i * 0.13;
+        const oscillator = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        oscillator.type = "triangle";
+        oscillator.frequency.setValueAtTime(freq, now);
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(0.32, now + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+
+        oscillator.connect(gain);
+        gain.connect(ctx.destination);
+        oscillator.start(now);
+        oscillator.stop(now + 0.32);
+      });
+    });
+  } catch {
+    // Audio is best-effort; completion still shows a toast and requests attention.
+  }
 }
 
 function collectPaneIds(node: LayoutNode | null): string[] {
@@ -437,19 +646,80 @@ function cancelScheduledFit(paneId: string) {
   }
 }
 
-function attachPtyListeners(ptyId: string, term: Terminal) {
+function attachPtyListeners(
+  ptyId: string,
+  term: Terminal,
+  onInput?: (ptyId: string, input: string) => void
+) {
   const onResize = term.onResize(({ cols, rows }) => {
     syncPtySizeForId(ptyId, cols, rows);
   });
   const onData = term.onData((d) => {
     // ConPTY expects CR; LF alone triggers PowerShell's >> continuation prompt.
     const input = d.replace(/\n/g, "\r");
+    onInput?.(ptyId, input);
     void invoke("write_powershell", { id: ptyId, input });
   });
   return {
     onResizeDispose: onResize.dispose,
     onDataDispose: onData.dispose,
   };
+}
+
+function Confetti() {
+  const pieces = useMemo(() => {
+    const out: {
+      left: number;
+      delay: number;
+      duration: number;
+      drift: number;
+      rotate: number;
+      color: string;
+      size: number;
+      shape: "square" | "circle" | "strip";
+    }[] = [];
+    for (let i = 0; i < CONFETTI_PIECES; i += 1) {
+      const size = 6 + Math.floor(Math.random() * 6);
+      const shapeRand = Math.random();
+      const shape: "square" | "circle" | "strip" =
+        shapeRand < 0.5 ? "square" : shapeRand < 0.8 ? "circle" : "strip";
+      out.push({
+        left: Math.random() * 100,
+        delay: Math.random() * 0.8,
+        duration: 1.6 + Math.random() * 1.4,
+        drift: (Math.random() - 0.5) * 120,
+        rotate: Math.random() * 360,
+        color:
+          CONFETTI_COLORS[
+            Math.floor(Math.random() * CONFETTI_COLORS.length)
+          ],
+        size,
+        shape,
+      });
+    }
+    return out;
+  }, []);
+
+  return (
+    <div className="confetti-layer" aria-hidden="true">
+      {pieces.map((p, i) => (
+        <span
+          key={i}
+          className={`confetti-piece confetti-${p.shape}`}
+          style={{
+            left: `${p.left}%`,
+            width: p.shape === "strip" ? 4 : p.size,
+            height: p.shape === "strip" ? p.size * 1.8 : p.size,
+            background: p.color,
+            animationDelay: `${p.delay}s`,
+            animationDuration: `${p.duration}s`,
+            ["--confetti-drift" as string]: `${p.drift}px`,
+            ["--confetti-rotate" as string]: `${p.rotate}deg`,
+          }}
+        />
+      ))}
+    </div>
+  );
 }
 
 function TermContainer({ win }: { win: Win }) {
@@ -554,6 +824,7 @@ function TiledNode({
   session,
   activeWinId,
   dragState,
+  blinkingPanes,
   onClose,
   onFocus,
   onHeaderPointerDown,
@@ -564,6 +835,7 @@ function TiledNode({
   session: Session;
   activeWinId: string | null;
   dragState: PaneDragState | null;
+  blinkingPanes: Set<string>;
   onClose: (winId: string) => void;
   onFocus: (winId: string) => void;
   onHeaderPointerDown: (
@@ -571,7 +843,7 @@ function TiledNode({
     e: React.PointerEvent<HTMLDivElement>
   ) => void;
   onResizeSplit: (splitId: string, deltaRatio: number) => void;
-  onLaunchAi: (paneId: string, cmd: string) => void;
+  onLaunchAi: (paneId: string, shortcut: AiShortcut) => void;
 }) {
   if (node.type === "leaf") {
     const win = session.windows.find((w) => w.paneId === node.winId);
@@ -582,7 +854,9 @@ function TiledNode({
         data-pane-id={win.paneId}
         className={`pane-cell ${activeWinId === win.paneId ? "active" : ""} ${
           dragState?.winId === win.paneId ? "dragging" : ""
-        } ${dragState?.targetWinId === win.paneId ? "drag-target" : ""}`}
+        } ${dragState?.targetWinId === win.paneId ? "drag-target" : ""} ${
+          blinkingPanes.has(win.paneId) ? "blinking" : ""
+        }`}
         onPointerDownCapture={() => onFocus(win.paneId)}
       >
         <div
@@ -599,7 +873,7 @@ function TiledNode({
                 title={sc.label}
                 onClick={(e) => {
                   e.stopPropagation();
-                  onLaunchAi(win.paneId, sc.cmd);
+                  onLaunchAi(win.paneId, sc);
                 }}
                 onPointerDown={(e) => e.stopPropagation()}
               >
@@ -625,6 +899,7 @@ function TiledNode({
         <div className="pane-term">
           <TermContainer win={win} />
         </div>
+        {blinkingPanes.has(win.paneId) && <Confetti />}
       </div>
     );
   }
@@ -637,6 +912,7 @@ function TiledNode({
           session={session}
           activeWinId={activeWinId}
           dragState={dragState}
+          blinkingPanes={blinkingPanes}
           onClose={onClose}
           onFocus={onFocus}
           onHeaderPointerDown={onHeaderPointerDown}
@@ -654,6 +930,7 @@ function TiledNode({
           session={session}
           activeWinId={activeWinId}
           dragState={dragState}
+          blinkingPanes={blinkingPanes}
           onClose={onClose}
           onFocus={onFocus}
           onHeaderPointerDown={onHeaderPointerDown}
@@ -675,6 +952,8 @@ function App() {
   );
   const [renameDraft, setRenameDraft] = useState("");
   const [fontSize, setFontSize] = useState<number>(loadStoredFontSize);
+  const [agentToasts, setAgentToasts] = useState<AgentToast[]>([]);
+  const [blinkingPanes, setBlinkingPanes] = useState<Set<string>>(new Set());
 
   const sessionsRef = useRef<Session[]>([]);
   const activeSessionRef = useRef<string | null>(null);
@@ -688,6 +967,15 @@ function App() {
   const pendingExitRef = useRef<Set<string>>(new Set());
   const intentionalKillRef = useRef<Set<string>>(new Set());
   const restartingPanesRef = useRef<Set<string>>(new Set());
+  const agentRunsRef = useRef<Map<string, AgentRun>>(new Map());
+  const markerTailRef = useRef<Map<string, string>>(new Map());
+  const agentHookUrlRef = useRef<string | null>(null);
+  const toastTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map()
+  );
+  const blinkTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map()
+  );
   const handlePtyExitRef = useRef<(ptyId: string) => void>(() => {});
   const fontSizeRef = useRef<number>(fontSize);
 
@@ -696,9 +984,191 @@ function App() {
   fontSizeRef.current = fontSize;
 
   useEffect(() => {
+    let cancelled = false;
+
+    void invoke<string>("agent_hook_url")
+      .then((url) => {
+        if (!cancelled) agentHookUrlRef.current = url;
+      })
+      .catch((error) => {
+        console.warn("Agent hook server is unavailable", error);
+      });
+
+    void invoke("ensure_agent_hooks").catch((error) => {
+      console.warn("Agent hook installation failed", error);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const dismissAgentToast = useCallback((id: string) => {
+    const timer = toastTimersRef.current.get(id);
+    if (timer) clearTimeout(timer);
+    toastTimersRef.current.delete(id);
+    setAgentToasts((prev) => prev.filter((toast) => toast.id !== id));
+  }, []);
+
+  const showAgentToast = useCallback((toast: AgentToast) => {
+    setAgentToasts((prev) => [...prev, toast].slice(-4));
+
+    const existing = toastTimersRef.current.get(toast.id);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(() => {
+      toastTimersRef.current.delete(toast.id);
+      setAgentToasts((prev) => prev.filter((item) => item.id !== toast.id));
+    }, AGENT_TOAST_MS);
+    toastTimersRef.current.set(toast.id, timer);
+  }, []);
+
+  const stopBlinkingPane = useCallback((paneId: string) => {
+    const timer = blinkTimersRef.current.get(paneId);
+    if (timer) {
+      clearTimeout(timer);
+      blinkTimersRef.current.delete(paneId);
+    }
+    setBlinkingPanes((prev) => {
+      if (!prev.has(paneId)) return prev;
+      const next = new Set(prev);
+      next.delete(paneId);
+      return next;
+    });
+  }, []);
+
+  const startBlinkingPane = useCallback((paneId: string) => {
+    setBlinkingPanes((prev) =>
+      prev.has(paneId) ? prev : new Set(prev).add(paneId)
+    );
+
+    const existing = blinkTimersRef.current.get(paneId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      blinkTimersRef.current.delete(paneId);
+      setBlinkingPanes((prev) => {
+        if (!prev.has(paneId)) return prev;
+        const next = new Set(prev);
+        next.delete(paneId);
+        return next;
+      });
+    }, AGENT_BLINK_MS);
+    blinkTimersRef.current.set(paneId, timer);
+  }, []);
+
+  const notifyAgentFinished = useCallback(
+    (run: AgentRun, exitCode: number) => {
+      const warning = exitCode !== 0;
+      showAgentToast({
+        id: `${run.token}-${Date.now()}`,
+        label: run.label,
+        sessionName: run.sessionName,
+        exitCode,
+        status: warning ? "warning" : "success",
+      });
+      playAgentCompletionSound(warning);
+      startBlinkingPane(run.paneId);
+      void getCurrentWindow()
+        .requestUserAttention(UserAttentionType.Informational)
+        .catch(() => undefined);
+    },
+    [showAgentToast, startBlinkingPane]
+  );
+
+  const clearAgentTracking = useCallback((ptyId: string) => {
+    agentRunsRef.current.delete(ptyId);
+    markerTailRef.current.delete(ptyId);
+  }, []);
+
+  const completeAgentRun = useCallback(
+    (ptyId: string, exitCode: number, removeRun = false) => {
+      const run = agentRunsRef.current.get(ptyId);
+      if (!run) return;
+
+      if (!run.notified) {
+        run.notified = true;
+        run.armed = false;
+        notifyAgentFinished(run, exitCode);
+      }
+
+      if (removeRun) {
+        clearAgentTracking(ptyId);
+      }
+    },
+    [clearAgentTracking, notifyAgentFinished]
+  );
+
+  const completeAgentRunByToken = useCallback(
+    (token: string, exitCode = 0) => {
+      for (const [ptyId, run] of agentRunsRef.current) {
+        if (run.token !== token) continue;
+        if (!run.armed || run.notified) return;
+        completeAgentRun(ptyId, exitCode);
+        return;
+      }
+    },
+    [completeAgentRun]
+  );
+
+  const clearPtyTransientState = useCallback(
+    (ptyId: string) => {
+      pendingOutputRef.current.delete(ptyId);
+      pendingExitRef.current.delete(ptyId);
+      clearAgentTracking(ptyId);
+    },
+    [clearAgentTracking]
+  );
+
+  const handleTerminalInput = useCallback(
+    (ptyId: string, input: string) => {
+      if (!input.includes("\r")) return;
+
+      const run = agentRunsRef.current.get(ptyId);
+      if (!run) return;
+
+      run.armed = true;
+      run.notified = false;
+    },
+    []
+  );
+
+  const processPtyData = useCallback(
+    (ptyId: string, data: string) => {
+      const buffered = (markerTailRef.current.get(ptyId) ?? "") + data;
+      const parsed = splitAgentCompletionMarkers(buffered);
+      if (parsed.tail) markerTailRef.current.set(ptyId, parsed.tail);
+      else markerTailRef.current.delete(ptyId);
+
+      let visible = parsed.visible;
+      const run = agentRunsRef.current.get(ptyId);
+      if (run) {
+        visible = processAgentRunOutput(run, visible);
+      }
+
+      for (const marker of parsed.markers) {
+        const directRun = agentRunsRef.current.get(ptyId);
+        if (directRun?.token === marker.token) {
+          completeAgentRun(ptyId, marker.exitCode, true);
+          continue;
+        }
+
+        for (const [runPtyId, pendingRun] of agentRunsRef.current) {
+          if (pendingRun.token !== marker.token) continue;
+          completeAgentRun(runPtyId, marker.exitCode, true);
+          break;
+        }
+      }
+
+      return visible;
+    },
+    [completeAgentRun]
+  );
+
+  useEffect(() => {
     let disposed = false;
     let unlistenOutput: UnlistenFn | null = null;
     let unlistenExit: UnlistenFn | null = null;
+    let unlistenAgentFinished: UnlistenFn | null = null;
 
     const findWindow = (id: string) => {
       for (const s of sessionsRef.current) {
@@ -710,27 +1180,35 @@ function App() {
 
     void Promise.all([
       listen<PtyOutputPayload>("pty-output", (e) => {
+        const data = processPtyData(e.payload.id, e.payload.data);
+        if (!data) return;
+
         const win = findWindow(e.payload.id);
         if (win && win.alive) {
-          win.term.write(e.payload.data);
+          win.term.write(data);
           return;
         }
 
         const pending = pendingOutputRef.current.get(e.payload.id) ?? "";
-        pendingOutputRef.current.set(e.payload.id, pending + e.payload.data);
+        pendingOutputRef.current.set(e.payload.id, pending + data);
       }),
       listen<string>("pty-exit", (e) => {
         handlePtyExitRef.current(e.payload);
       }),
-    ]).then(([output, exit]) => {
+      listen<AgentHookFinishedPayload>("agent-finished", (e) => {
+        completeAgentRunByToken(e.payload.runId);
+      }),
+    ]).then(([output, exit, agentFinished]) => {
       if (disposed) {
         output();
         exit();
+        agentFinished();
         return;
       }
 
       unlistenOutput = output;
       unlistenExit = exit;
+      unlistenAgentFinished = agentFinished;
       setPtyListenersReady(true);
     });
 
@@ -738,39 +1216,41 @@ function App() {
       disposed = true;
       unlistenOutput?.();
       unlistenExit?.();
+      unlistenAgentFinished?.();
     };
-  }, []);
+  }, [completeAgentRunByToken, processPtyData]);
 
   const createWin = useCallback(
     async (cwd?: string | null, paneId?: string): Promise<Win> => {
-    const id = await invoke<string>("spawn_powershell", { cwd: cwd ?? null });
-    const term = new Terminal({
-      fontFamily: "Cascadia Code, Consolas, Courier New, monospace",
-      fontSize: fontSizeRef.current,
-      cursorBlink: true,
-      scrollback: 10000,
-      windowsPty: { backend: "conpty" },
-      theme: {
-        background: "#1e1e1e",
-        foreground: "#cccccc",
-        cursor: "#ffffff",
-      },
-    });
-    const fitAddon = new FitAddon();
-    term.loadAddon(fitAddon);
-    const listeners = attachPtyListeners(id, term);
+      const id = await invoke<string>("spawn_powershell", { cwd: cwd ?? null });
+      const term = new Terminal({
+        fontFamily: "Cascadia Code, Consolas, Courier New, monospace",
+        fontSize: fontSizeRef.current,
+        cursorBlink: true,
+        scrollback: 10000,
+        windowsPty: { backend: "conpty" },
+        theme: {
+          background: "#1e1e1e",
+          foreground: "#cccccc",
+          cursor: "#ffffff",
+        },
+      });
+      const fitAddon = new FitAddon();
+      term.loadAddon(fitAddon);
+      const listeners = attachPtyListeners(id, term, handleTerminalInput);
 
-    return {
-      paneId: paneId ?? createPaneId(),
-      id,
-      term,
-      fitAddon,
-      onResizeDispose: listeners.onResizeDispose,
-      onDataDispose: listeners.onDataDispose,
-      alive: true,
-    };
-  },
-  []);
+      return {
+        paneId: paneId ?? createPaneId(),
+        id,
+        term,
+        fitAddon,
+        onResizeDispose: listeners.onResizeDispose,
+        onDataDispose: listeners.onDataDispose,
+        alive: true,
+      };
+    },
+    [handleTerminalInput]
+  );
 
   const restartWin = useCallback(async (paneId: string) => {
     if (closingRef.current || restartingPanesRef.current.has(paneId)) {
@@ -798,13 +1278,16 @@ function App() {
     try {
       void invoke("kill_powershell", { id: oldWin.id });
       clearSyncedPtySize(oldWin.id);
-      pendingOutputRef.current.delete(oldWin.id);
-      pendingExitRef.current.delete(oldWin.id);
+      clearPtyTransientState(oldWin.id);
       oldWin.onResizeDispose();
       oldWin.onDataDispose();
 
       const newId = await invoke<string>("spawn_powershell", { cwd });
-      const listeners = attachPtyListeners(newId, oldWin.term);
+      const listeners = attachPtyListeners(
+        newId,
+        oldWin.term,
+        handleTerminalInput
+      );
       const updatedWin: Win = {
         ...oldWin,
         id: newId,
@@ -827,11 +1310,12 @@ function App() {
     } finally {
       restartingPanesRef.current.delete(paneId);
     }
-  }, []);
+  }, [clearPtyTransientState, handleTerminalInput]);
 
   const handlePtyExit = useCallback(
     (ptyId: string) => {
       if (closingRef.current) return;
+      clearAgentTracking(ptyId);
       if (intentionalKillRef.current.has(ptyId)) {
         intentionalKillRef.current.delete(ptyId);
         return;
@@ -855,7 +1339,7 @@ function App() {
         pendingExitRef.current.add(ptyId);
       }
     },
-    [restartWin]
+    [clearAgentTracking, restartWin]
   );
 
   handlePtyExitRef.current = handlePtyExit;
@@ -934,19 +1418,50 @@ function App() {
     setSessions((prev) =>
       prev.map((s) => (s.id === sid ? { ...s, activeWinId: winId } : s))
     );
-  }, []);
+    stopBlinkingPane(winId);
+  }, [stopBlinkingPane]);
 
-  const launchAi = useCallback((paneId: string, cmd: string) => {
+  const launchAi = useCallback(async (paneId: string, shortcut: AiShortcut) => {
     const session = sessionsRef.current.find((s) =>
       s.windows.some((w) => w.paneId === paneId)
     );
     if (!session) return;
     const win = session.windows.find((w) => w.paneId === paneId);
-    if (!win || !win.alive) return;
+    if (!win || !win.alive || agentRunsRef.current.has(win.id)) return;
+
+    const hookUrl =
+      agentHookUrlRef.current ??
+      (await invoke<string>("agent_hook_url").catch(() => null));
+    if (!hookUrl) return;
+    agentHookUrlRef.current = hookUrl;
+
+    const token = createAgentRunToken();
+    const input = buildAgentCommand(
+      shortcut.command,
+      token,
+      hookUrl,
+      shortcut.label
+    );
+    agentRunsRef.current.set(win.id, {
+      token,
+      label: shortcut.label,
+      sessionName: session.name,
+      paneId,
+      command: shortcut.command,
+      echoText: input.replace(/\r$/, ""),
+      echoMatched: 0,
+      echoDisplayed: false,
+      armed: false,
+      notified: false,
+    });
+    stopBlinkingPane(paneId);
+
     fitAndRefresh(win);
-    void invoke("write_powershell", { id: win.id, input: cmd });
+    void invoke("write_powershell", { id: win.id, input }).catch(() => {
+      clearAgentTracking(win.id);
+    });
     win.term.focus();
-  }, []);
+  }, [clearAgentTracking, stopBlinkingPane]);
 
   const applyFontSizeAll = useCallback((size: number) => {
     const next = clampFontSize(size);
@@ -1010,11 +1525,11 @@ function App() {
   }, [createWin]);
 
   const closeWindow = useCallback((paneId: string) => {
+    stopBlinkingPane(paneId);
     for (const s of sessionsRef.current) {
       const w = s.windows.find((x) => x.paneId === paneId);
       if (!w) continue;
-      pendingOutputRef.current.delete(w.id);
-      pendingExitRef.current.delete(w.id);
+      clearPtyTransientState(w.id);
       cancelScheduledFit(w.paneId);
       intentionalKillRef.current.add(w.id);
       clearSyncedPtySize(w.id);
@@ -1041,14 +1556,14 @@ function App() {
       );
       break;
     }
-  }, []);
+  }, [clearPtyTransientState, stopBlinkingPane]);
 
   const closeSession = useCallback((sessionId: string) => {
     const sess = sessionsRef.current.find((s) => s.id === sessionId);
     if (!sess) return;
     for (const w of sess.windows) {
-      pendingOutputRef.current.delete(w.id);
-      pendingExitRef.current.delete(w.id);
+      stopBlinkingPane(w.paneId);
+      clearPtyTransientState(w.id);
       cancelScheduledFit(w.paneId);
       intentionalKillRef.current.add(w.id);
       clearSyncedPtySize(w.id);
@@ -1062,7 +1577,7 @@ function App() {
     if (activeSessionRef.current === sessionId) {
       setActiveSessionId(remaining[remaining.length - 1]?.id ?? null);
     }
-  }, []);
+  }, [clearPtyTransientState, stopBlinkingPane]);
 
   const swapPanes = useCallback((fromId: string, toId: string) => {
     if (fromId === toId) return;
@@ -1298,10 +1813,17 @@ function App() {
   useEffect(() => {
     return () => {
       flushSave();
+      for (const timer of toastTimersRef.current.values()) {
+        clearTimeout(timer);
+      }
+      toastTimersRef.current.clear();
+      for (const timer of blinkTimersRef.current.values()) {
+        clearTimeout(timer);
+      }
+      blinkTimersRef.current.clear();
       for (const s of sessionsRef.current) {
         for (const w of s.windows) {
-          pendingOutputRef.current.delete(w.id);
-          pendingExitRef.current.delete(w.id);
+          clearPtyTransientState(w.id);
           cancelScheduledFit(w.paneId);
           intentionalKillRef.current.add(w.id);
           clearSyncedPtySize(w.id);
@@ -1312,7 +1834,7 @@ function App() {
         }
       }
     };
-  }, [flushSave]);
+  }, [clearPtyTransientState, flushSave]);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId);
   const activeWindowIds =
@@ -1522,6 +2044,7 @@ function App() {
                           session={session}
                           activeWinId={session.activeWinId}
                           dragState={isActive ? paneDrag : null}
+                          blinkingPanes={isActive ? blinkingPanes : new Set()}
                           onClose={closeWindow}
                           onFocus={setActiveWin}
                           onHeaderPointerDown={beginPaneDrag}
@@ -1559,6 +2082,39 @@ function App() {
           </div>
         )}
       </main>
+
+      {agentToasts.length > 0 && (
+        <div
+          className="agent-toast-stack"
+          aria-live="polite"
+          aria-atomic="false"
+        >
+          {agentToasts.map((toast) => {
+            const warning = toast.status === "warning";
+            return (
+              <div key={toast.id} className={`agent-toast ${toast.status}`}>
+                <div className="agent-toast-main">
+                  <span className="agent-toast-title">
+                    {toast.label} finished
+                  </span>
+                  <span className="agent-toast-meta">
+                    {toast.sessionName} - {warning
+                      ? `exited with code ${toast.exitCode}`
+                      : "ready for review"}
+                  </span>
+                </div>
+                <button
+                  className="agent-toast-close"
+                  title="Close alert"
+                  onClick={() => dismissAgentToast(toast.id)}
+                >
+                  x
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
