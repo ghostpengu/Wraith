@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
@@ -35,6 +36,13 @@ struct PtyOutput {
 struct AgentHookFinished {
     run_id: String,
     agent: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentChatCompletionResponse {
+    status: u16,
+    body: String,
 }
 
 fn kill_instance(id: &str, state: &AppState) {
@@ -172,6 +180,19 @@ fn user_home() -> Result<PathBuf, String> {
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .ok_or_else(|| "user home directory not found".to_string())
+}
+
+fn agent_settings_path(home: &Path) -> PathBuf {
+    home.join(".wraith").join("agent.json")
+}
+
+fn default_agent_settings() -> Value {
+    json!({
+        "provider": "openrouter",
+        "model": "anthropic/claude-3.5-sonnet",
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": ""
+    })
 }
 
 fn write_json_pretty(path: &Path, value: &Value) -> Result<(), String> {
@@ -343,6 +364,76 @@ fn agent_hook_url(state: State<'_, AppState>) -> Result<String, String> {
         .map_err(|e| format!("lock poisoned: {e}"))?
         .clone()
         .ok_or_else(|| "agent hook server not ready".to_string())
+}
+
+#[tauri::command]
+fn load_agent_settings() -> Result<Value, String> {
+    let home = user_home()?;
+    let path = agent_settings_path(&home);
+    if !path.exists() {
+        return Ok(default_agent_settings());
+    }
+    let value = load_json_object(&path)?;
+    // Merge with defaults so missing keys are filled in.
+    let mut defaults = default_agent_settings();
+    if let (Some(defaults_obj), Some(value_obj)) = (defaults.as_object_mut(), value.as_object()) {
+        for (key, val) in value_obj {
+            defaults_obj.insert(key.clone(), val.clone());
+        }
+    }
+    Ok(defaults)
+}
+
+#[tauri::command]
+fn save_agent_settings(state: Value) -> Result<(), String> {
+    let home = user_home()?;
+    let path = agent_settings_path(&home);
+    write_json_pretty(&path, &state)
+}
+
+#[tauri::command]
+async fn agent_chat_completion(
+    url: String,
+    headers: HashMap<String, String>,
+    body: Value,
+) -> Result<AgentChatCompletionResponse, String> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let target = reqwest::Url::parse(&url).map_err(|e| format!("invalid URL: {e}"))?;
+    if target.scheme() != "https" && target.scheme() != "http" {
+        return Err("agent URL must use http or https".to_string());
+    }
+
+    let mut header_map = HeaderMap::new();
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| format!("invalid header {name}: {e}"))?;
+        let header_value = HeaderValue::from_str(&value)
+            .map_err(|e| format!("invalid header value for {name}: {e}"))?;
+        header_map.insert(header_name, header_value);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|e| format!("HTTP client failed: {e}"))?;
+    let response = client
+        .post(target)
+        .headers(header_map)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("read response failed: {e}"))?;
+
+    Ok(AgentChatCompletionResponse { status, body })
 }
 
 #[tauri::command]
@@ -561,7 +652,10 @@ pub fn run() {
             load_sessions,
             save_sessions,
             agent_hook_url,
-            ensure_agent_hooks
+            ensure_agent_hooks,
+            load_agent_settings,
+            save_agent_settings,
+            agent_chat_completion
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

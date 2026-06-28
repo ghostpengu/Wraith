@@ -18,6 +18,13 @@ src/
   App.tsx       # Main UI: sessions, tiling layout, xterm integration
   App.css       # VS Code–inspired dark theme (CSS variables)
   main.tsx      # React entry
+  agent/        # AI agent pane (chat UI, LLM streaming, tool loop)
+    AgentPaneView.tsx     # Chat UI + approval cards
+    AgentSettingsModal.tsx # Provider/model/key form
+    useAgent.ts           # LLM streaming + tool loop with approval
+    tools.ts              # Tool schemas + executors (list_panes, read_pane, run_command)
+    paneBuffer.ts         # pty-output scrollback subscription
+    commandMarker.ts      # Shared __WRAITH_AGENT_DONE__ marker logic
 src-tauri/
   src/lib.rs    # PTY commands and event emission
   tauri.conf.json
@@ -65,6 +72,8 @@ The frontend uses Tauri `invoke` for commands and `listen` for events.
 | `resize_powershell` | Resize PTY (`cols`, `rows`) |
 | `kill_powershell` | Terminate PTY process |
 | `list_powershell` | List active PTY ids |
+| `load_agent_settings` | Load `~/.wraith/agent.json` (merged with defaults) |
+| `save_agent_settings` | Persist provider/model/baseUrl/apiKey to `~/.wraith/agent.json` |
 
 | Event | Payload | Purpose |
 |-------|---------|---------|
@@ -87,6 +96,16 @@ Helper functions in `App.tsx` handle insert, remove, swap, and resize. New panes
 - **Session** — named tab with multiple `Win` objects and one layout tree
 - **Win** — xterm `Terminal` + `FitAddon`, tied to a PTY `id`
 - Sessions are kept mounted but hidden (`session-view` / `aria-hidden`) so xterm state survives tab switches
+
+### AI agent pane
+
+A leaf in the tiling tree can be `kind: "agent"` instead of a terminal. The `+ Agent` toolbar button splits the active pane to create one. The agent pane renders `<AgentPaneView>` (a chat UI) instead of an xterm container.
+
+- **LLM calls** happen in the frontend (`src/agent/useAgent.ts`) via `fetch` SSE against an OpenAI-compatible `/chat/completions` endpoint. Provider selectable in the settings modal: OpenRouter or Ollama Cloud. Settings persist to `~/.wraith/agent.json` via the `load_agent_settings` / `save_agent_settings` Tauri commands.
+- **Pane observation** — `PaneBufferStore` (`src/agent/paneBuffer.ts`) subscribes to `pty-output` and keeps a per-`ptyId` scrollback ring buffer. The `read_pane` tool reads from it.
+- **Command execution** — the `run_command` tool wraps the command with `buildAgentCommand` (the same `__WRAITH_AGENT_DONE__` marker used by the legacy AI-shortcut path) and writes it via `write_powershell`. A one-shot `pty-output` listener waits for the marker token and captures output + exit code.
+- **Approve-every-command** — when the model emits a `run_command` tool call, the assistant message pauses in `awaiting-approval` status and renders an Approve/Decline card. Only after approval does the command run; the result is fed back to the model and the stream continues. Read tools (`list_panes`, `read_pane`) run without approval.
+- **Persistence** — agent panes are stripped from the layout before `save_sessions` (`stripAgentLeaves`), so they are fresh per session for MVP.
 
 ## Code conventions
 

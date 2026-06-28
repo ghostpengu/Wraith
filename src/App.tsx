@@ -10,6 +10,16 @@ import openaiIcon from "./assets/ai-openai.svg";
 import claudeIcon from "./assets/ai-claude.svg";
 import opencodeIcon from "./assets/ai-opencode.svg";
 import appLogo from "./assets/wraith-logo.png";
+import { AgentPaneView } from "./agent/AgentPaneView";
+import {
+  psSingleQuote,
+  buildAgentCommand as buildAgentCommandShared,
+  createAgentRunToken as createAgentRunTokenShared,
+  splitAgentCompletionMarkers as splitAgentCompletionMarkersShared,
+} from "./agent/commandMarker";
+import type { OrchestratorApi, PaneAgentName } from "./agent/orchestratorTypes";
+import { waitForAgentToken, waitForPaneOutput } from "./agent/orchestratorWait";
+import type { PaneInfo } from "./agent/tools";
 import "./App.css";
 
 interface AiShortcut {
@@ -49,11 +59,6 @@ interface AgentRun {
   notified: boolean;
 }
 
-interface AgentCompletionMarker {
-  token: string;
-  exitCode: number;
-}
-
 interface AgentToast {
   id: string;
   label: string;
@@ -66,6 +71,7 @@ type SplitDir = "row" | "column";
 
 interface LayoutLeaf {
   type: "leaf";
+  kind?: "terminal" | "agent";
   winId: string;
 }
 
@@ -140,7 +146,6 @@ const DEFAULT_FONT_SIZE = 13;
 const MIN_FONT_SIZE = 8;
 const MAX_FONT_SIZE = 32;
 const FONT_SIZE_STORAGE_KEY = "wraith:font-size";
-const AGENT_DONE_MARKER = "__WRAITH_AGENT_DONE__";
 const AGENT_TOAST_MS = 5000;
 const AGENT_BLINK_MS = 3000;
 const CONFETTI_PIECES = 28;
@@ -168,105 +173,19 @@ function createPaneId() {
   return `pane-${Date.now()}-${paneSerial}`;
 }
 
-function createAgentRunToken() {
+const createAgentRunToken = () => createAgentRunTokenShared(() => {
   agentRunSerial += 1;
-  return `run-${Date.now()}-${agentRunSerial}`;
-}
+  return agentRunSerial;
+});
+const buildAgentCommand = buildAgentCommandShared;
+const splitAgentCompletionMarkers = splitAgentCompletionMarkersShared;
 
-function psSingleQuote(value: string) {
-  return value.replace(/'/g, "''");
-}
-
-function commandWithAgentFlags(command: string, label: string) {
-  const trimmed = command.trim();
-  if (
-    label === "codex" &&
-    /^codex(?:\.exe)?(?:\s|$)/i.test(trimmed) &&
-    !/\s--dangerously-bypass-hook-trust(?:\s|$)/.test(trimmed)
-  ) {
-    return trimmed.replace(
-      /^codex(?:\.exe)?/i,
-      (match) => `${match} --dangerously-bypass-hook-trust`
-    );
-  }
-
-  return trimmed;
-}
-
-function buildAgentCommand(
-  command: string,
-  token: string,
-  hookUrl: string,
-  label: string
-) {
-  const trimmed = commandWithAgentFlags(command, label);
-  const hookEnv =
-    `$env:WRAITH_AGENT_HOOK_URL='${psSingleQuote(hookUrl)}'; ` +
-    `$env:WRAITH_AGENT_RUN_ID='${psSingleQuote(token)}'; ` +
-    `$env:WRAITH_AGENT_LABEL='${psSingleQuote(label)}'; `;
-  const markerExpression =
-    "[string]::Concat('__WRAITH','_AGENT_DONE__',':','" +
-    token +
-    "',':',$wraithExitCode)";
-  const line =
-    "& { " +
-    hookEnv +
-    "$global:LASTEXITCODE = 0; " +
-    trimmed +
-    "; $wraithExitCode = if ($LASTEXITCODE -ne 0) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }; Write-Host (" +
-    markerExpression +
-    ") }";
-
-  return `${line}\r`;
-}
-
-function findIncompleteAgentMarkerStart(value: string) {
-  const markerStart = value.lastIndexOf(AGENT_DONE_MARKER);
-  if (markerStart !== -1 && !/[\r\n]/.test(value.slice(markerStart))) {
-    return markerStart;
-  }
-
-  const maxPrefix = Math.min(value.length, AGENT_DONE_MARKER.length - 1);
-  for (let len = maxPrefix; len > 0; len -= 1) {
-    if (value.endsWith(AGENT_DONE_MARKER.slice(0, len))) {
-      return value.length - len;
-    }
-  }
-
-  return -1;
-}
-
-function splitAgentCompletionMarkers(input: string): {
-  visible: string;
-  markers: AgentCompletionMarker[];
-  tail: string;
-} {
-  const markerPattern = /__WRAITH_AGENT_DONE__:([A-Za-z0-9_-]+):(-?\d+)\r?\n?/g;
-  const markers: AgentCompletionMarker[] = [];
-  let visible = "";
-  let cursor = 0;
-  let match: RegExpExecArray | null = null;
-
-  while ((match = markerPattern.exec(input)) !== null) {
-    visible += input.slice(cursor, match.index);
-    markers.push({
-      token: match[1],
-      exitCode: Number.parseInt(match[2], 10),
-    });
-    cursor = match.index + match[0].length;
-  }
-
-  const remainder = input.slice(cursor);
-  const incompleteStart = findIncompleteAgentMarkerStart(remainder);
-  if (incompleteStart === -1) {
-    return { visible: visible + remainder, markers, tail: "" };
-  }
-
-  return {
-    visible: visible + remainder.slice(0, incompleteStart),
-    markers,
-    tail: remainder.slice(incompleteStart),
-  };
+function buildAgentLaunchCommand(agent: PaneAgentName, task: string): string {
+  const shortcut = AI_SHORTCUTS.find((s) => s.label === agent);
+  const base = shortcut?.command ?? agent;
+  const trimmed = task.trim();
+  if (!trimmed) return base;
+  return `${base} ${psSingleQuote(trimmed)}`;
 }
 
 function processAgentRunOutput(run: AgentRun, data: string) {
@@ -337,6 +256,27 @@ function collectPaneIds(node: LayoutNode | null): string[] {
   return [...collectPaneIds(node.first), ...collectPaneIds(node.second)];
 }
 
+function stripAgentLeaves(node: LayoutNode | null): LayoutNode | null {
+  if (!node) return null;
+  if (node.type === "leaf") {
+    return node.kind === "agent" ? null : node;
+  }
+  const first = stripAgentLeaves(node.first);
+  const second = stripAgentLeaves(node.second);
+  if (!first && !second) return null;
+  if (!first) return second;
+  if (!second) return first;
+  return { ...node, first, second };
+}
+
+function firstTerminalLeafId(node: LayoutNode | null): string | null {
+  if (!node) return null;
+  if (node.type === "leaf") {
+    return node.kind === "agent" ? null : node.winId;
+  }
+  return firstTerminalLeafId(node.first) ?? firstTerminalLeafId(node.second);
+}
+
 function toPersistedState(
   sessions: Session[],
   activeSessionId: string | null
@@ -344,13 +284,24 @@ function toPersistedState(
   return {
     version: 1,
     activeSessionId,
-    sessions: sessions.map((s) => ({
-      id: s.id,
-      name: s.name,
-      folder: s.folder,
-      activePaneId: s.activeWinId,
-      layout: s.layout,
-    })),
+    sessions: sessions.map((s) => {
+      const layout = stripAgentLeaves(s.layout);
+      let activePaneId = s.activeWinId;
+      if (activePaneId) {
+        const leaf = findLeafById(s.layout, activePaneId);
+        if (leaf?.kind === "agent") {
+          activePaneId = firstTerminalLeafId(layout);
+        }
+      }
+      if (!activePaneId) activePaneId = firstTerminalLeafId(layout);
+      return {
+        id: s.id,
+        name: s.name,
+        folder: s.folder,
+        activePaneId,
+        layout,
+      };
+    }),
   };
 }
 
@@ -475,6 +426,19 @@ function firstLeafId(node: LayoutNode | null): string | null {
   return firstLeafId(node.first) ?? firstLeafId(node.second);
 }
 
+function findLeafById(
+  node: LayoutNode | null,
+  id: string
+): LayoutLeaf | null {
+  if (!node) return null;
+  if (node.type === "leaf") return node.winId === id ? node : null;
+  return findLeafById(node.first, id) ?? findLeafById(node.second, id);
+}
+
+function containsLeafId(node: LayoutNode | null, id: string): boolean {
+  return findLeafById(node, id) !== null;
+}
+
 function insertWindow(
   node: LayoutNode,
   targetWinId: string,
@@ -489,7 +453,7 @@ function insertWindow(
       id: createSplitId(),
       dir,
       ratio: 0.5,
-      first: { type: "leaf", winId: targetWinId },
+      first: node,
       second: { type: "leaf", winId: newWinId },
     };
   }
@@ -519,17 +483,25 @@ function swapWindowIds(
   firstWinId: string,
   secondWinId: string
 ): LayoutNode {
-  if (node.type === "leaf") {
-    if (node.winId === firstWinId) return { ...node, winId: secondWinId };
-    if (node.winId === secondWinId) return { ...node, winId: firstWinId };
-    return node;
-  }
+  const firstLeaf = findLeafById(node, firstWinId);
+  const secondLeaf = findLeafById(node, secondWinId);
+  if (!firstLeaf || !secondLeaf) return node;
 
-  return {
-    ...node,
-    first: swapWindowIds(node.first, firstWinId, secondWinId),
-    second: swapWindowIds(node.second, firstWinId, secondWinId),
+  const swapLeaf = (current: LayoutNode): LayoutNode => {
+    if (current.type === "leaf") {
+      if (current.winId === firstWinId) return { ...secondLeaf };
+      if (current.winId === secondWinId) return { ...firstLeaf };
+      return current;
+    }
+
+    return {
+      ...current,
+      first: swapLeaf(current.first),
+      second: swapLeaf(current.second),
+    };
   };
+
+  return swapLeaf(node);
 }
 
 function adjustSplitRatio(
@@ -830,13 +802,15 @@ function TiledNode({
   onHeaderPointerDown,
   onResizeSplit,
   onLaunchAi,
+  panesProvider,
+  orchestrator,
 }: {
   node: LayoutNode;
   session: Session;
   activeWinId: string | null;
   dragState: PaneDragState | null;
   blinkingPanes: Set<string>;
-  onClose: (winId: string) => void;
+  onClose: (paneId: string) => void;
   onFocus: (winId: string) => void;
   onHeaderPointerDown: (
     winId: string,
@@ -844,8 +818,51 @@ function TiledNode({
   ) => void;
   onResizeSplit: (splitId: string, deltaRatio: number) => void;
   onLaunchAi: (paneId: string, shortcut: AiShortcut) => void;
+  panesProvider: () => PaneInfo[];
+  orchestrator: OrchestratorApi;
 }) {
   if (node.type === "leaf") {
+    if (node.kind === "agent") {
+      return (
+        <div
+          data-pane-id={node.winId}
+          className={`pane-cell pane-cell-agent ${
+            activeWinId === node.winId ? "active" : ""
+          } ${dragState?.winId === node.winId ? "dragging" : ""} ${
+            dragState?.targetWinId === node.winId ? "drag-target" : ""
+          }`}
+          onPointerDownCapture={() => onFocus(node.winId)}
+        >
+          <div
+            className="pane-header pane-header-agent"
+            onPointerDown={(e) => onHeaderPointerDown(node.winId, e)}
+          >
+            <span className="pane-dot agent" />
+            <span className="pane-label">AI</span>
+            <span className="pane-agent-spacer" />
+            <button
+              className="pane-close"
+              title="Close agent pane"
+              onClick={(e) => {
+                e.stopPropagation();
+                onClose(node.winId);
+              }}
+            >
+              ×
+            </button>
+          </div>
+          <div className="pane-agent-body">
+            <AgentPaneView
+              sessionName={session.name}
+              folder={session.folder}
+              panes={panesProvider}
+              orchestrator={orchestrator}
+            />
+          </div>
+        </div>
+      );
+    }
+
     const win = session.windows.find((w) => w.paneId === node.winId);
     if (!win) return null;
 
@@ -918,6 +935,8 @@ function TiledNode({
           onHeaderPointerDown={onHeaderPointerDown}
           onResizeSplit={onResizeSplit}
           onLaunchAi={onLaunchAi}
+          panesProvider={panesProvider}
+          orchestrator={orchestrator}
         />
       </div>
       <TilingDivider
@@ -936,6 +955,8 @@ function TiledNode({
           onHeaderPointerDown={onHeaderPointerDown}
           onResizeSplit={onResizeSplit}
           onLaunchAi={onLaunchAi}
+          panesProvider={panesProvider}
+          orchestrator={orchestrator}
         />
       </div>
     </div>
@@ -1463,6 +1484,114 @@ function App() {
     win.term.focus();
   }, [clearAgentTracking, stopBlinkingPane]);
 
+  const orchestrator = useMemo<OrchestratorApi>(
+    () => ({
+      listAgentRuns: () => {
+        const runs = [];
+        for (const [ptyId, run] of agentRunsRef.current) {
+          runs.push({
+            paneId: run.paneId,
+            ptyId,
+            label: run.label,
+            busy: run.armed && !run.notified,
+          });
+        }
+        return runs;
+      },
+      launchAgent: async (paneId, agent, task) => {
+        const session = sessionsRef.current.find((s) =>
+          s.windows.some((w) => w.paneId === paneId)
+        );
+        if (!session) {
+          return { output: "error: pane not found in active sessions", exitCode: 1 };
+        }
+        const win = session.windows.find((w) => w.paneId === paneId);
+        if (!win || !win.alive) {
+          return { output: "error: pane is not alive", exitCode: 1 };
+        }
+        if (agentRunsRef.current.has(win.id)) {
+          return {
+            output: "error: an agent is already running in this pane; use prompt_pane instead",
+            exitCode: 1,
+          };
+        }
+
+        const hookUrl =
+          agentHookUrlRef.current ??
+          (await invoke<string>("agent_hook_url").catch(() => null));
+        if (!hookUrl) {
+          return { output: "error: agent hook server not ready", exitCode: 1 };
+        }
+        agentHookUrlRef.current = hookUrl;
+
+        const token = createAgentRunToken();
+        const command = buildAgentLaunchCommand(agent, task);
+        const input = buildAgentCommand(command, token, hookUrl, agent);
+        agentRunsRef.current.set(win.id, {
+          token,
+          label: agent,
+          sessionName: session.name,
+          paneId,
+          command,
+          echoText: input.replace(/\r$/, ""),
+          echoMatched: 0,
+          echoDisplayed: false,
+          armed: true,
+          notified: false,
+        });
+
+        const waitPromise = waitForAgentToken(token);
+        try {
+          await invoke("write_powershell", { id: win.id, input });
+        } catch {
+          clearAgentTracking(win.id);
+          return { output: "error: failed to write to pane", exitCode: 1 };
+        }
+
+        const result = await waitPromise;
+        clearAgentTracking(win.id);
+        return result;
+      },
+      promptPane: async (paneId, prompt) => {
+        const session = sessionsRef.current.find((s) =>
+          s.windows.some((w) => w.paneId === paneId)
+        );
+        if (!session) {
+          return { output: "error: pane not found in active sessions", exitCode: 1 };
+        }
+        const win = session.windows.find((w) => w.paneId === paneId);
+        if (!win || !win.alive) {
+          return { output: "error: pane is not alive", exitCode: 1 };
+        }
+
+        const trimmed = prompt.trim();
+        if (!trimmed) {
+          return { output: "error: prompt is empty", exitCode: 1 };
+        }
+
+        const input = `${trimmed}\r`;
+        const run = agentRunsRef.current.get(win.id);
+        const waitPromise = run
+          ? waitForAgentToken(run.token)
+          : waitForPaneOutput(win.id);
+
+        if (run) {
+          run.armed = true;
+          run.notified = false;
+        }
+
+        try {
+          await invoke("write_powershell", { id: win.id, input });
+        } catch {
+          return { output: "error: failed to write to pane", exitCode: 1 };
+        }
+
+        return waitPromise;
+      },
+    }),
+    [clearAgentTracking]
+  );
+
   const applyFontSizeAll = useCallback((size: number) => {
     const next = clampFontSize(size);
     setFontSize(next);
@@ -1524,8 +1653,82 @@ function App() {
     );
   }, [createWin]);
 
+  const addAgentToActive = useCallback(() => {
+    const sid = activeSessionRef.current;
+    if (!sid) return;
+    const session = sessionsRef.current.find((s) => s.id === sid);
+    if (!session) return;
+
+    const paneId = createPaneId();
+    setSessions((prev) =>
+      prev.map((s) => {
+        if (s.id !== sid) return s;
+        const targetWinId = s.activeWinId ?? firstLeafId(s.layout) ?? paneId;
+        const activeRect =
+          s.layout && targetWinId !== paneId
+            ? findLeafRect(s.layout, targetWinId, {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+              })
+            : null;
+        const dir: SplitDir =
+          !activeRect || activeRect.width >= activeRect.height
+            ? "row"
+            : "column";
+        const agentLeaf: LayoutLeaf = {
+          type: "leaf",
+          kind: "agent",
+          winId: paneId,
+        };
+        const layout: LayoutNode = s.layout
+          ? insertWindow(s.layout, targetWinId, paneId, dir)
+          : agentLeaf;
+
+        // Mark the inserted leaf as an agent leaf.
+        const markAgent = (n: LayoutNode): LayoutNode => {
+          if (n.type === "leaf") {
+            return n.winId === paneId ? { ...n, kind: "agent" } : n;
+          }
+          return { ...n, first: markAgent(n.first), second: markAgent(n.second) };
+        };
+        const finalLayout = markAgent(layout);
+
+        return {
+          ...s,
+          layout: finalLayout,
+          activeWinId: paneId,
+        };
+      })
+    );
+  }, []);
+
   const closeWindow = useCallback((paneId: string) => {
     stopBlinkingPane(paneId);
+
+    // Agent panes have no Win/PTY; just remove them from the layout.
+    let isAgentPane = false;
+    for (const s of sessionsRef.current) {
+      const leaf = findLeafById(s.layout, paneId);
+      if (leaf?.kind === "agent") {
+        isAgentPane = true;
+        break;
+      }
+    }
+    if (isAgentPane) {
+      setSessions((prev) =>
+        prev.map((session) => {
+          if (!containsLeafId(session.layout, paneId)) return session;
+          const layout = removeWindow(session.layout, paneId);
+          const activeWinId =
+            session.activeWinId === paneId ? firstLeafId(layout) : session.activeWinId;
+          return { ...session, layout, activeWinId };
+        })
+      );
+      return;
+    }
+
     for (const s of sessionsRef.current) {
       const w = s.windows.find((x) => x.paneId === paneId);
       if (!w) continue;
@@ -2001,6 +2204,13 @@ function App() {
               >
                 + Pane
               </button>
+              <button
+                className="tool-btn agent-tool-btn"
+                title="Add AI agent pane"
+                onClick={() => addAgentToActive()}
+              >
+                + Agent
+              </button>
               <div className="toolbar-spacer" />
               <div className="font-size-group" title="Terminal text size (Ctrl + / - / 0)">
                 <button
@@ -2050,6 +2260,18 @@ function App() {
                           onHeaderPointerDown={beginPaneDrag}
                           onResizeSplit={resizeSplit}
                           onLaunchAi={launchAi}
+                          orchestrator={orchestrator}
+                          panesProvider={() =>
+                            session.windows
+                              .filter((w) => w.alive)
+                              .map((w) => ({
+                                paneId: w.paneId,
+                                ptyId: w.id,
+                                sessionName: session.name,
+                                folder: session.folder,
+                                alive: w.alive,
+                              }))
+                          }
                         />
                       ) : (
                         <div className="empty-pane">
