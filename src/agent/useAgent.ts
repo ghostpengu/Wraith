@@ -14,11 +14,14 @@ import {
 } from "./tools";
 import { createAgentRunToken } from "./commandMarker";
 
+export type DictationStyle = "clean" | "verbatim" | "command-safe";
+
 export interface AgentSettings {
   provider: "openrouter" | "ollama";
   model: string;
   baseUrl: string;
   apiKey: string;
+  dictationStyle: DictationStyle;
 }
 
 export type MessageStatus =
@@ -285,7 +288,13 @@ export function useAgent(
               ? OLLAMA_CLOUD_API_BASE_URL
               : OPENROUTER_BASE_URL;
         const apiKey = typeof obj.apiKey === "string" ? obj.apiKey : "";
-        setSettings(normalizeSettings({ provider, model, baseUrl, apiKey }));
+        const dictationStyle =
+          obj.dictationStyle === "verbatim" || obj.dictationStyle === "command-safe"
+            ? obj.dictationStyle
+            : "clean";
+        setSettings(
+          normalizeSettings({ provider, model, baseUrl, apiKey, dictationStyle })
+        );
       })
       .catch(() => undefined);
   }, []);
@@ -710,6 +719,7 @@ export function useAgent(
         model: normalized.model,
         baseUrl: normalized.baseUrl,
         apiKey: normalized.apiKey,
+        dictationStyle: normalized.dictationStyle,
       },
     }).catch(() => undefined);
   }, []);

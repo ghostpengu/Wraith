@@ -45,6 +45,13 @@ struct AgentChatCompletionResponse {
     body: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentAudioTranscriptionResponse {
+    status: u16,
+    body: String,
+}
+
 fn kill_instance(id: &str, state: &AppState) {
     let removed = state.pty.lock().ok().and_then(|mut map| map.remove(id));
     if let Some(mut instance) = removed {
@@ -191,7 +198,8 @@ fn default_agent_settings() -> Value {
         "provider": "openrouter",
         "model": "anthropic/claude-3.5-sonnet",
         "baseUrl": "https://openrouter.ai/api/v1",
-        "apiKey": ""
+        "apiKey": "",
+        "dictationStyle": "clean"
     })
 }
 
@@ -397,6 +405,25 @@ async fn agent_chat_completion(
     headers: HashMap<String, String>,
     body: Value,
 ) -> Result<AgentChatCompletionResponse, String> {
+    let (status, body) = post_json(url, headers, body).await?;
+    Ok(AgentChatCompletionResponse { status, body })
+}
+
+#[tauri::command]
+async fn agent_audio_transcription(
+    url: String,
+    headers: HashMap<String, String>,
+    body: Value,
+) -> Result<AgentAudioTranscriptionResponse, String> {
+    let (status, body) = post_json(url, headers, body).await?;
+    Ok(AgentAudioTranscriptionResponse { status, body })
+}
+
+async fn post_json(
+    url: String,
+    headers: HashMap<String, String>,
+    body: Value,
+) -> Result<(u16, String), String> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
     let target = reqwest::Url::parse(&url).map_err(|e| format!("invalid URL: {e}"))?;
@@ -433,7 +460,7 @@ async fn agent_chat_completion(
         .await
         .map_err(|e| format!("read response failed: {e}"))?;
 
-    Ok(AgentChatCompletionResponse { status, body })
+    Ok((status, body))
 }
 
 #[tauri::command]
@@ -655,7 +682,8 @@ pub fn run() {
             ensure_agent_hooks,
             load_agent_settings,
             save_agent_settings,
-            agent_chat_completion
+            agent_chat_completion,
+            agent_audio_transcription
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

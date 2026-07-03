@@ -20,6 +20,16 @@ import {
 import type { OrchestratorApi, PaneAgentName } from "./agent/orchestratorTypes";
 import { waitForAgentToken, waitForPaneOutput } from "./agent/orchestratorWait";
 import type { PaneInfo } from "./agent/tools";
+import {
+  errorMessage,
+  formatElapsed,
+  loadDictationSettings,
+  MAX_DICTATION_MS,
+  selectRecorderMimeType,
+  transcribeDictationBlob,
+  validateDictationSettings,
+  type DictationStatus,
+} from "./agent/dictation";
 import "./App.css";
 
 interface AiShortcut {
@@ -106,6 +116,14 @@ interface PaneDragSession {
   targetWinId: string | null;
 }
 
+interface PaneDictationState {
+  paneId: string;
+  status: DictationStatus;
+  seconds: number;
+  error: string | null;
+  levels: number[];
+}
+
 interface Win {
   paneId: string;
   id: string;
@@ -149,6 +167,13 @@ const FONT_SIZE_STORAGE_KEY = "wraith:font-size";
 const AGENT_TOAST_MS = 5000;
 const AGENT_BLINK_MS = 3000;
 const CONFETTI_PIECES = 28;
+const DICTATION_BAR_COUNT = 18;
+const DICTATION_IDLE_LEVEL = 0.18;
+
+function dictationLevels(level = DICTATION_IDLE_LEVEL) {
+  return Array.from({ length: DICTATION_BAR_COUNT }, () => level);
+}
+
 const CONFETTI_COLORS = [
   "#ffeb00",
   "#ff4d4d",
@@ -791,6 +816,47 @@ function TilingDivider({
   );
 }
 
+function DictationBubble({ state, onCancel }: {
+  state: PaneDictationState;
+  onCancel: () => void;
+}) {
+  const active = state.status === "recording";
+  const label =
+    state.status === "recording"
+      ? formatElapsed(state.seconds)
+      : state.status === "transcribing"
+        ? "transcribing"
+        : state.status === "polishing"
+          ? "polishing"
+          : state.error ?? "dictation";
+
+  return (
+    <div className={`dictation-bubble ${state.status}`}>
+      <button
+        type="button"
+        className="dictation-bubble-pill"
+        onClick={active ? onCancel : undefined}
+        title={active ? "Cancel dictation" : label}
+        aria-label={active ? "Cancel dictation" : label}
+      >
+        <span className="dictation-wave" aria-hidden="true">
+          {state.levels.map((level, index) => (
+            <span
+              key={index}
+              className="dictation-wave-bar"
+              style={{
+                ["--bar-index" as string]: index,
+                ["--bar-level" as string]: level,
+              }}
+            />
+          ))}
+        </span>
+      </button>
+      <div className="dictation-bubble-label">{label}</div>
+    </div>
+  );
+}
+
 function TiledNode({
   node,
   session,
@@ -802,6 +868,9 @@ function TiledNode({
   onHeaderPointerDown,
   onResizeSplit,
   onLaunchAi,
+  dictation,
+  onToggleDictation,
+  onCancelDictation,
   panesProvider,
   orchestrator,
 }: {
@@ -818,6 +887,9 @@ function TiledNode({
   ) => void;
   onResizeSplit: (splitId: string, deltaRatio: number) => void;
   onLaunchAi: (paneId: string, shortcut: AiShortcut) => void;
+  dictation: PaneDictationState | null;
+  onToggleDictation: (paneId: string) => void;
+  onCancelDictation: () => void;
   panesProvider: () => PaneInfo[];
   orchestrator: OrchestratorApi;
 }) {
@@ -865,6 +937,10 @@ function TiledNode({
 
     const win = session.windows.find((w) => w.paneId === node.winId);
     if (!win) return null;
+    const paneDictation = dictation?.paneId === win.paneId ? dictation : null;
+    const dictationProcessing =
+      paneDictation?.status === "transcribing" || paneDictation?.status === "polishing";
+    const dictationActiveElsewhere = !!dictation && dictation.paneId !== win.paneId;
 
     return (
       <div
@@ -883,6 +959,20 @@ function TiledNode({
           <span className="pane-dot" />
           <span className="pane-label">PS</span>
           <div className="pane-ai-shortcuts">
+            <button
+              className={`pane-ai-btn pane-dictation-btn ${paneDictation?.status ?? ""}`}
+              title={paneDictation?.status === "recording" ? "Stop dictation" : "Dictate into pane"}
+              disabled={dictationProcessing || dictationActiveElsewhere}
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggleDictation(win.paneId);
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <span className="pane-dictation-glyph" aria-hidden="true">
+                {paneDictation?.status === "recording" ? "■" : "🎙"}
+              </span>
+            </button>
             {AI_SHORTCUTS.map((sc) => (
               <button
                 key={sc.label}
@@ -916,6 +1006,9 @@ function TiledNode({
         <div className="pane-term">
           <TermContainer win={win} />
         </div>
+        {paneDictation && (
+          <DictationBubble state={paneDictation} onCancel={onCancelDictation} />
+        )}
         {blinkingPanes.has(win.paneId) && <Confetti />}
       </div>
     );
@@ -935,6 +1028,9 @@ function TiledNode({
           onHeaderPointerDown={onHeaderPointerDown}
           onResizeSplit={onResizeSplit}
           onLaunchAi={onLaunchAi}
+          dictation={dictation}
+          onToggleDictation={onToggleDictation}
+          onCancelDictation={onCancelDictation}
           panesProvider={panesProvider}
           orchestrator={orchestrator}
         />
@@ -955,6 +1051,9 @@ function TiledNode({
           onHeaderPointerDown={onHeaderPointerDown}
           onResizeSplit={onResizeSplit}
           onLaunchAi={onLaunchAi}
+          dictation={dictation}
+          onToggleDictation={onToggleDictation}
+          onCancelDictation={onCancelDictation}
           panesProvider={panesProvider}
           orchestrator={orchestrator}
         />
@@ -975,6 +1074,7 @@ function App() {
   const [fontSize, setFontSize] = useState<number>(loadStoredFontSize);
   const [agentToasts, setAgentToasts] = useState<AgentToast[]>([]);
   const [blinkingPanes, setBlinkingPanes] = useState<Set<string>>(new Set());
+  const [paneDictation, setPaneDictation] = useState<PaneDictationState | null>(null);
 
   const sessionsRef = useRef<Session[]>([]);
   const activeSessionRef = useRef<string | null>(null);
@@ -997,12 +1097,301 @@ function App() {
   const blinkTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map()
   );
+  const paneDictationRecorderRef = useRef<MediaRecorder | null>(null);
+  const paneDictationStreamRef = useRef<MediaStream | null>(null);
+  const paneDictationChunksRef = useRef<Blob[]>([]);
+  const paneDictationCanceledRef = useRef(false);
+  const paneDictationTimerRef = useRef<number | null>(null);
+  const paneDictationMaxTimerRef = useRef<number | null>(null);
+  const paneDictationPaneIdRef = useRef<string | null>(null);
+  const paneDictationAudioContextRef = useRef<AudioContext | null>(null);
+  const paneDictationAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const paneDictationAnalyserRef = useRef<AnalyserNode | null>(null);
+  const paneDictationLevelFrameRef = useRef<number | null>(null);
+  const paneDictationLevelDataRef = useRef<Uint8Array | null>(null);
   const handlePtyExitRef = useRef<(ptyId: string) => void>(() => {});
   const fontSizeRef = useRef<number>(fontSize);
 
   sessionsRef.current = sessions;
   activeSessionRef.current = activeSessionId;
   fontSizeRef.current = fontSize;
+
+  const findWinByPaneId = useCallback((paneId: string): Win | null => {
+    for (const session of sessionsRef.current) {
+      const win = session.windows.find((candidate) => candidate.paneId === paneId);
+      if (win) return win;
+    }
+    return null;
+  }, []);
+
+  const clearPaneDictationTimers = useCallback(() => {
+    if (paneDictationTimerRef.current !== null) {
+      window.clearInterval(paneDictationTimerRef.current);
+      paneDictationTimerRef.current = null;
+    }
+    if (paneDictationMaxTimerRef.current !== null) {
+      window.clearTimeout(paneDictationMaxTimerRef.current);
+      paneDictationMaxTimerRef.current = null;
+    }
+  }, []);
+
+  const stopPaneDictationTracks = useCallback(() => {
+    paneDictationStreamRef.current?.getTracks().forEach((track) => track.stop());
+    paneDictationStreamRef.current = null;
+  }, []);
+
+  const stopPaneDictationLevelMeter = useCallback(() => {
+    if (paneDictationLevelFrameRef.current !== null) {
+      window.cancelAnimationFrame(paneDictationLevelFrameRef.current);
+      paneDictationLevelFrameRef.current = null;
+    }
+    paneDictationLevelDataRef.current = null;
+    paneDictationAudioSourceRef.current?.disconnect();
+    paneDictationAudioSourceRef.current = null;
+    paneDictationAnalyserRef.current?.disconnect();
+    paneDictationAnalyserRef.current = null;
+    const ctx = paneDictationAudioContextRef.current;
+    paneDictationAudioContextRef.current = null;
+    if (ctx && ctx.state !== "closed") {
+      void ctx.close().catch(() => undefined);
+    }
+  }, []);
+
+  const startPaneDictationLevelMeter = useCallback(
+    (stream: MediaStream, paneId: string) => {
+      stopPaneDictationLevelMeter();
+      const audioWindow = window as Window &
+        typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+      const AudioContextCtor = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
+      if (!AudioContextCtor) return;
+
+      try {
+        const ctx = new AudioContextCtor();
+        const analyser = ctx.createAnalyser();
+        const source = ctx.createMediaStreamSource(stream);
+        analyser.fftSize = 64;
+        analyser.smoothingTimeConstant = 0.68;
+        source.connect(analyser);
+
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        paneDictationAudioContextRef.current = ctx;
+        paneDictationAudioSourceRef.current = source;
+        paneDictationAnalyserRef.current = analyser;
+        paneDictationLevelDataRef.current = data;
+
+        const sample = () => {
+          const currentAnalyser = paneDictationAnalyserRef.current;
+          const currentData = paneDictationLevelDataRef.current;
+          if (!currentAnalyser || !currentData) return;
+          currentAnalyser.getByteFrequencyData(currentData);
+
+          const levels = Array.from({ length: DICTATION_BAR_COUNT }, (_, index) => {
+            const start = Math.floor((index / DICTATION_BAR_COUNT) * currentData.length);
+            const end = Math.max(
+              start + 1,
+              Math.floor(((index + 1) / DICTATION_BAR_COUNT) * currentData.length)
+            );
+            let sum = 0;
+            for (let i = start; i < end; i += 1) sum += currentData[i] ?? 0;
+            const average = sum / Math.max(1, end - start);
+            return Math.max(0.08, Math.min(1, average / 145));
+          });
+
+          setPaneDictation((current) =>
+            current?.paneId === paneId && current.status === "recording"
+              ? { ...current, levels }
+              : current
+          );
+          paneDictationLevelFrameRef.current = window.requestAnimationFrame(sample);
+        };
+
+        void ctx.resume().catch(() => undefined);
+        paneDictationLevelFrameRef.current = window.requestAnimationFrame(sample);
+      } catch {
+        stopPaneDictationLevelMeter();
+      }
+    },
+    [stopPaneDictationLevelMeter]
+  );
+
+  const finishPaneDictationRecording = useCallback(() => {
+    clearPaneDictationTimers();
+    stopPaneDictationLevelMeter();
+    stopPaneDictationTracks();
+    paneDictationRecorderRef.current = null;
+  }, [clearPaneDictationTimers, stopPaneDictationLevelMeter, stopPaneDictationTracks]);
+
+  const clearPaneDictationLater = useCallback((paneId: string) => {
+    window.setTimeout(() => {
+      setPaneDictation((current) => (current?.paneId === paneId ? null : current));
+    }, 3800);
+  }, []);
+
+  const writeDictationToPane = useCallback(async (paneId: string, text: string) => {
+    const win = findWinByPaneId(paneId);
+    const cleaned = text.trim();
+    if (!win || !win.alive || !cleaned) return;
+
+    win.term.focus();
+    await invoke("write_powershell", { id: win.id, input: cleaned });
+  }, [findWinByPaneId]);
+
+  const handlePaneDictationAudio = useCallback(
+    async (paneId: string, blob: Blob) => {
+      try {
+        setPaneDictation({ paneId, status: "transcribing", seconds: 0, error: null, levels: dictationLevels(0.36) });
+        const settings = await loadDictationSettings();
+        const validationError = validateDictationSettings(settings);
+        if (validationError) throw new Error(validationError);
+        if (settings.dictationStyle !== "verbatim") {
+          setPaneDictation({ paneId, status: "polishing", seconds: 0, error: null, levels: dictationLevels(0.44) });
+        }
+
+        const result = await transcribeDictationBlob(settings, blob, "terminal");
+        await writeDictationToPane(paneId, result.text);
+
+        if (result.cleanupError) {
+          setPaneDictation({
+            paneId,
+            status: "error",
+            seconds: 0,
+            error: "Inserted raw transcript",
+            levels: dictationLevels(0.14),
+          });
+          clearPaneDictationLater(paneId);
+        } else {
+          setPaneDictation((current) => (current?.paneId === paneId ? null : current));
+        }
+      } catch (err) {
+        setPaneDictation({
+          paneId,
+          status: "error",
+          seconds: 0,
+          error: errorMessage(err),
+          levels: dictationLevels(0.14),
+        });
+        clearPaneDictationLater(paneId);
+      }
+    },
+    [clearPaneDictationLater, writeDictationToPane]
+  );
+
+  const stopPaneDictation = useCallback(() => {
+    const recorder = paneDictationRecorderRef.current;
+    if (!recorder || recorder.state === "inactive") return;
+    const paneId = paneDictationPaneIdRef.current;
+    if (paneId) {
+      setPaneDictation((current) =>
+        current?.paneId === paneId ? { ...current, status: "transcribing" } : current
+      );
+    }
+    clearPaneDictationTimers();
+    recorder.requestData();
+    recorder.stop();
+  }, [clearPaneDictationTimers]);
+
+  const cancelPaneDictation = useCallback(() => {
+    const recorder = paneDictationRecorderRef.current;
+    paneDictationCanceledRef.current = true;
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+    finishPaneDictationRecording();
+    paneDictationChunksRef.current = [];
+    paneDictationPaneIdRef.current = null;
+    setPaneDictation(null);
+  }, [finishPaneDictationRecording]);
+
+  const startPaneDictation = useCallback(
+    async (paneId: string) => {
+      const win = findWinByPaneId(paneId);
+      if (!win || !win.alive) return;
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+        setPaneDictation({
+          paneId,
+          status: "error",
+          seconds: 0,
+          error: "Microphone recording is not available in this WebView.",
+          levels: dictationLevels(0.14),
+        });
+        clearPaneDictationLater(paneId);
+        return;
+      }
+
+      try {
+        const settings = await loadDictationSettings();
+        const validationError = validateDictationSettings(settings);
+        if (validationError) throw new Error(validationError);
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        const mimeType = selectRecorderMimeType();
+        const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+
+        paneDictationStreamRef.current = stream;
+        paneDictationRecorderRef.current = recorder;
+        paneDictationChunksRef.current = [];
+        paneDictationCanceledRef.current = false;
+        paneDictationPaneIdRef.current = paneId;
+
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) paneDictationChunksRef.current.push(event.data);
+        };
+        recorder.onerror = () => {
+          finishPaneDictationRecording();
+          setPaneDictation({ paneId, status: "error", seconds: 0, error: "Microphone recording failed.", levels: dictationLevels(0.14) });
+          clearPaneDictationLater(paneId);
+        };
+        recorder.onstop = () => {
+          const canceled = paneDictationCanceledRef.current;
+          const chunks = paneDictationChunksRef.current;
+          const type = recorder.mimeType || mimeType || "audio/webm";
+          paneDictationChunksRef.current = [];
+          paneDictationPaneIdRef.current = null;
+          finishPaneDictationRecording();
+          if (canceled) return;
+          void handlePaneDictationAudio(paneId, new Blob(chunks, { type }));
+        };
+
+        setActiveWin(paneId);
+        win.term.focus();
+        recorder.start();
+        setPaneDictation({ paneId, status: "recording", seconds: 0, error: null, levels: dictationLevels() });
+        startPaneDictationLevelMeter(stream, paneId);
+        paneDictationTimerRef.current = window.setInterval(() => {
+          setPaneDictation((current) =>
+            current?.paneId === paneId && current.status === "recording"
+              ? { ...current, seconds: current.seconds + 1 }
+              : current
+          );
+        }, 1000);
+        paneDictationMaxTimerRef.current = window.setTimeout(stopPaneDictation, MAX_DICTATION_MS);
+      } catch (err) {
+        finishPaneDictationRecording();
+        setPaneDictation({ paneId, status: "error", seconds: 0, error: errorMessage(err), levels: dictationLevels(0.14) });
+        clearPaneDictationLater(paneId);
+      }
+    },
+    [
+      clearPaneDictationLater,
+      findWinByPaneId,
+      finishPaneDictationRecording,
+      handlePaneDictationAudio,
+      startPaneDictationLevelMeter,
+      stopPaneDictation,
+    ]
+  );
+
+  const togglePaneDictation = useCallback(
+    (paneId: string) => {
+      if (paneDictation?.paneId === paneId && paneDictation.status === "recording") {
+        stopPaneDictation();
+        return;
+      }
+      if (paneDictation?.status === "transcribing" || paneDictation?.status === "polishing") return;
+      void startPaneDictation(paneId);
+    },
+    [paneDictation, startPaneDictation, stopPaneDictation]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -2024,6 +2413,16 @@ function App() {
         clearTimeout(timer);
       }
       blinkTimersRef.current.clear();
+      paneDictationCanceledRef.current = true;
+      const recorder = paneDictationRecorderRef.current;
+      if (recorder) {
+        recorder.ondataavailable = null;
+        recorder.onerror = null;
+        recorder.onstop = null;
+        if (recorder.state !== "inactive") recorder.stop();
+      }
+      clearPaneDictationTimers();
+      stopPaneDictationTracks();
       for (const s of sessionsRef.current) {
         for (const w of s.windows) {
           clearPtyTransientState(w.id);
@@ -2037,7 +2436,7 @@ function App() {
         }
       }
     };
-  }, [clearPtyTransientState, flushSave]);
+  }, [clearPaneDictationTimers, clearPtyTransientState, flushSave, stopPaneDictationTracks]);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId);
   const activeWindowIds =
@@ -2083,6 +2482,29 @@ function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [zoomFontIn, zoomFontOut, resetFontSize]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || !e.shiftKey || e.key !== " ") return;
+      const activeElement = document.activeElement as HTMLElement | null;
+      if (activeElement?.closest(".agent-pane")) return;
+
+      const session = sessionsRef.current.find(
+        (candidate) => candidate.id === activeSessionRef.current
+      );
+      const paneId = session?.activeWinId;
+      if (!session || !paneId) return;
+      const leaf = findLeafById(session.layout, paneId);
+      if (leaf?.kind === "agent") return;
+      if (!session.windows.some((win) => win.paneId === paneId && win.alive)) return;
+
+      e.preventDefault();
+      togglePaneDictation(paneId);
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [togglePaneDictation]);
 
   useEffect(() => {
 
@@ -2260,6 +2682,9 @@ function App() {
                           onHeaderPointerDown={beginPaneDrag}
                           onResizeSplit={resizeSplit}
                           onLaunchAi={launchAi}
+                          dictation={paneDictation}
+                          onToggleDictation={togglePaneDictation}
+                          onCancelDictation={cancelPaneDictation}
                           orchestrator={orchestrator}
                           panesProvider={() =>
                             session.windows
@@ -2342,3 +2767,10 @@ function App() {
 }
 
 export default App;
+
+
+
+
+
+
+

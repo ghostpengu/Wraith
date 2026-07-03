@@ -25,6 +25,7 @@ export function AgentSettingsModal({ settings, onClose, onSave }: AgentSettingsM
   const [model, setModel] = useState(settings?.model ?? PRESETS.openrouter.model);
   const [baseUrl, setBaseUrl] = useState(settings?.baseUrl ?? PRESETS.openrouter.baseUrl);
   const [apiKey, setApiKey] = useState(settings?.apiKey ?? "");
+  const [dictationStyle, setDictationStyle] = useState(settings?.dictationStyle ?? "clean");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -33,6 +34,7 @@ export function AgentSettingsModal({ settings, onClose, onSave }: AgentSettingsM
       setModel(settings.model);
       setBaseUrl(settings.baseUrl);
       setApiKey(settings.apiKey);
+      setDictationStyle(settings.dictationStyle);
     }
   }, [settings]);
 
@@ -47,7 +49,7 @@ export function AgentSettingsModal({ settings, onClose, onSave }: AgentSettingsM
     e.preventDefault();
     setSaving(true);
     try {
-      await onSave({ provider, model, baseUrl, apiKey });
+      await onSave({ provider, model, baseUrl, apiKey, dictationStyle });
     } finally {
       setSaving(false);
     }
@@ -127,6 +129,42 @@ export function AgentSettingsModal({ settings, onClose, onSave }: AgentSettingsM
             spellCheck={false}
             autoComplete="off"
           />
+        </div>
+
+        <div className="agent-modal-row">
+          <label className="agent-modal-label">Dictation style</label>
+          <div className="agent-modal-radio-row agent-modal-radio-row-wrap">
+            <label className="agent-modal-radio">
+              <input
+                type="radio"
+                name="dictation-style"
+                value="clean"
+                checked={dictationStyle === "clean"}
+                onChange={() => setDictationStyle("clean")}
+              />
+              <span>Clean</span>
+            </label>
+            <label className="agent-modal-radio">
+              <input
+                type="radio"
+                name="dictation-style"
+                value="command-safe"
+                checked={dictationStyle === "command-safe"}
+                onChange={() => setDictationStyle("command-safe")}
+              />
+              <span>Command-safe</span>
+            </label>
+            <label className="agent-modal-radio">
+              <input
+                type="radio"
+                name="dictation-style"
+                value="verbatim"
+                checked={dictationStyle === "verbatim"}
+                onChange={() => setDictationStyle("verbatim")}
+              />
+              <span>Verbatim</span>
+            </label>
+          </div>
         </div>
 
         <footer className="agent-modal-footer">
