@@ -16,7 +16,7 @@ A tiling terminal emulator with a built-in AI agent pane. Built for Windows with
 
 ---
 
-Wraith is a Windows desktop terminal that runs PowerShell inside real pseudo-terminals (PTY) and renders them in a VS Code–style dark tiling layout — sessions, splits, drag-to-swap panes. Each leaf in the pane tree can be either a terminal **or** an AI agent chat that can see your panes, read their output, and run commands with your approval.
+Wraith is a Windows desktop terminal that runs PowerShell inside real pseudo-terminals (PTY) and renders them in a tiling layout — sessions, splits, drag-to-swap panes. Each leaf in the pane tree can be either a terminal **or** an AI agent chat that can see your panes, read their output, and run commands with your approval. A built-in Settings modal covers themes, terminal fonts/colors, AI providers, and window behavior.
 
 ## Features
 
@@ -24,8 +24,17 @@ Wraith is a Windows desktop terminal that runs PowerShell inside real pseudo-ter
 - Real PTY-backed PowerShell sessions (Rust + `portable-pty`)
 - Tiling pane tree — horizontal/vertical splits, aspect-ratio-aware direction, drag-to-swap
 - Session tabs kept mounted and hidden so terminal state survives tab switches
-- VS Code-inspired dark theme via CSS variables
-- Font zoom, `Cascadia Code` terminal stack, `FitAddon`-driven resizing
+- 16 built-in themes (VS Code Dark, Midnight, Dracula, Nord, Tokyo Night, Catppuccin Mocha, Gruvbox, Monokai, Solarized, Forest, Ember, Light, Paper, High-Contrast, …)
+- Custom terminal colors (foreground / background / cursor / selection) override the theme
+- Font picker with preset catalog (incl. Google Font loading), size 8–32, `FitAddon`-driven resizing
+- Font zoom, `Cascadia Code` terminal stack by default
+
+### Sidebar
+- Collapsible, resizable sidebar (drag the handle; snaps closed below a threshold)
+- Session folders — group sessions, collapse/expand, rename, delete (sessions return to top level)
+- Drag-and-drop to reorder sessions and folders, or drop sessions into folders
+- Header actions menu (Settings, New session, New linked session, New folder)
+- Per-session pane count badges
 
 ### AI agent pane
 - A pane can be `kind: "agent"` instead of a terminal — launched from the `+ Agent` button
@@ -35,7 +44,7 @@ Wraith is a Windows desktop terminal that runs PowerShell inside real pseudo-ter
   - `read_pane` — read scrollback from any pane via a ring buffer
   - `run_command` — execute a command in a pane (with **Approve / Decline** gate)
 - Approval cards pause the stream until you accept; read-only tools run automatically
-- Settings persist to `~/.wraith/agent.json`
+- Provider/model/base URL/API key configured in **Settings → AI** (persisted to `~/.wraith/settings.json`)
 - Markdown rendering for assistant messages
 
 ### Niceties
@@ -43,6 +52,8 @@ Wraith is a Windows desktop terminal that runs PowerShell inside real pseudo-ter
 - AI shortcuts for `codex`, `opencode`, `claude`, `grok` directly in the toolbar
 - Agent completion notifications — blinking pane, confetti, chime
 - Dictation support (voice → text) in the agent pane
+- Confirm-before-close dialogs for panes and sessions (toggle in **Settings → General**)
+- Window size/position persistence across restarts
 
 ## Screenshots
 
@@ -94,11 +105,10 @@ cargo build
 
 ```
 src/
-  App.tsx                  # Main UI: sessions, tiling, xterm integration
-  App.css                  # VS Code–inspired dark theme
+  App.tsx                  # Main UI: sessions, tiling, xterm, sidebar, settings modal
+  App.css                  # Theme + layout styles (CSS variables)
   agent/
     AgentPaneView.tsx       # Chat UI + approval cards
-    AgentSettingsModal.tsx  # Provider/model/key form
     useAgent.ts             # LLM streaming + tool loop with approval
     tools.ts                # Tool schemas + executors
     paneBuffer.ts           # Per-PTY scrollback ring buffer
@@ -107,8 +117,15 @@ src/
     orchestratorWait.ts     # Token / pane-output waiters
     AgentMarkdown.tsx       # Markdown rendering for messages
     dictation.ts            # Voice dictation helpers
+  settings/
+    types.ts                # AppSettings schema + normalizer
+    themes.ts               # 16 theme palettes
+    fonts.ts                # Font presets + Google Font loading
+    applyAppearance.ts      # Apply theme/terminal colors to xterm + CSS vars
+    useAppSettings.ts       # Load/save settings hook
+    AppSettingsModal.tsx    # Tabbed Settings dialog (Appearance/Terminal/AI/General)
 src-tauri/
-  src/lib.rs               # PTY commands + event emission
+  src/lib.rs               # PTY commands + settings persistence + event emission
   tauri.conf.json
   Cargo.toml
 ```
@@ -126,8 +143,11 @@ The frontend uses Tauri `invoke` for commands and `listen` for events.
 | `resize_powershell` | Resize a PTY (`cols`, `rows`) |
 | `kill_powershell` | Terminate a PTY process |
 | `list_powershell` | List active PTY ids |
-| `load_agent_settings` | Load `~/.wraith/agent.json` (merged with defaults) |
-| `save_agent_settings` | Persist provider/model/baseUrl/apiKey |
+| `load_app_settings` | Load `~/.wraith/settings.json` (merged with defaults) |
+| `save_app_settings` | Persist appearance/terminal/AI/general settings |
+| `load_agent_settings` | Read the `ai` section of app settings (legacy compatibility) |
+| `save_agent_settings` | Merge provider/model/baseUrl/apiKey into app settings |
+| `agent_hook_url` | Optional webhook URL for agent notifications |
 
 | Event | Payload | Purpose |
 |-------|---------|---------|
@@ -201,7 +221,7 @@ Before finishing a change:
 
 ## License
 
-Not yet specified. Add a `LICENSE` file before public release.
+Released under the [MIT License](./LICENSE).
 
 <div align="center">
 
