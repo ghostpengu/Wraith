@@ -232,14 +232,17 @@ export interface UseAgentApi {
 export function useAgent(
   folder: string | null,
   sessionName: string,
-  orchestrator: OrchestratorApi
+  orchestrator: OrchestratorApi,
+  externalSettings?: AgentSettings | null
 ): UseAgentApi {
   const [thread, setThread] = useState<AgentThread>({
     messages: [],
     busy: false,
     error: null,
   });
-  const [settings, setSettings] = useState<AgentSettings | null>(null);
+  const [settings, setSettings] = useState<AgentSettings | null>(
+    externalSettings ? normalizeSettings(externalSettings) : null
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const bufferRef = useRef<PaneBufferStore>(new PaneBufferStore());
@@ -269,7 +272,12 @@ export function useAgent(
     };
   }, []);
 
+  // Prefer parent-owned AI settings (App Settings) when provided; otherwise load from disk.
   useEffect(() => {
+    if (externalSettings) {
+      setSettings(normalizeSettings(externalSettings));
+      return;
+    }
     void invoke<unknown>("load_agent_settings")
       .then((raw) => {
         if (!raw || typeof raw !== "object") return;
@@ -297,7 +305,7 @@ export function useAgent(
         );
       })
       .catch(() => undefined);
-  }, []);
+  }, [externalSettings]);
 
   useEffect(() => {
     void invoke<string>("agent_hook_url")

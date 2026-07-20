@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { invoke } from "@tauri-apps/api/core";
+import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -20,6 +22,20 @@ import {
 import type { OrchestratorApi, PaneAgentName } from "./agent/orchestratorTypes";
 import { waitForAgentToken, waitForPaneOutput } from "./agent/orchestratorWait";
 import type { PaneInfo } from "./agent/tools";
+import {
+  AppSettingsModal,
+  applyTerminalAppearance,
+  clampFontSize,
+  COLLAPSED_SIDEBAR_WIDTH,
+  DEFAULT_FONT_SIZE,
+  MAX_SIDEBAR_WIDTH,
+  MIN_SIDEBAR_WIDTH,
+  ensureFontStackReady,
+  resolveTerminalTheme,
+  SIDEBAR_COLLAPSE_THRESHOLD,
+  useAppSettings,
+  type AiSettings,
+} from "./settings";
 import {
   errorMessage,
   formatElapsed,
@@ -151,19 +167,59 @@ interface PersistedSession {
   layout: LayoutNode | null;
 }
 
+interface SidebarFolder {
+  id: string;
+  name: string;
+  collapsed: boolean;
+  sessionIds: string[];
+}
+
+interface SidebarSessionItem {
+  type: "session";
+  id: string;
+}
+
+interface SidebarFolderItem {
+  type: "folder";
+  id: string;
+}
+
+type SidebarItem = SidebarSessionItem | SidebarFolderItem;
+
+interface SidebarState {
+  folders: SidebarFolder[];
+  items: SidebarItem[];
+}
+
+interface SidebarDragState {
+  kind: "session" | "folder";
+  id: string;
+  target: SidebarDropTarget | null;
+}
+
+interface SidebarPointerDragSession extends SidebarDragState {
+  startX: number;
+  startY: number;
+  active: boolean;
+}
+
+type SidebarDropTarget =
+  | { type: "top-level"; index: number }
+  | { type: "folder"; folderId: string }
+  | { type: "folder-content"; folderId: string; index: number };
+
 interface PersistedState {
-  version: 1;
+  version: 2;
   activeSessionId: string | null;
   sessions: PersistedSession[];
+  folders: SidebarFolder[];
+  sidebarItems: SidebarItem[];
 }
 
 const sessionName = (i: number) => `Session ${i + 1}`;
 const dragStartDistance = 5;
 const saveDebounceMs = 500;
-const DEFAULT_FONT_SIZE = 13;
-const MIN_FONT_SIZE = 8;
-const MAX_FONT_SIZE = 32;
-const FONT_SIZE_STORAGE_KEY = "wraith:font-size";
+const WINDOW_GEOMETRY_DEBOUNCE_MS = 400;
 const AGENT_TOAST_MS = 5000;
 const AGENT_BLINK_MS = 3000;
 const CONFETTI_PIECES = 28;
@@ -187,6 +243,7 @@ const CONFETTI_COLORS = [
 let splitSerial = 0;
 let paneSerial = 0;
 let agentRunSerial = 0;
+let sidebarFolderSerial = 0;
 
 function createSplitId() {
   splitSerial += 1;
@@ -196,6 +253,11 @@ function createSplitId() {
 function createPaneId() {
   paneSerial += 1;
   return `pane-${Date.now()}-${paneSerial}`;
+}
+
+function createSidebarFolderId() {
+  sidebarFolderSerial += 1;
+  return `folder-${Date.now()}-${sidebarFolderSerial}`;
 }
 
 const createAgentRunToken = () => createAgentRunTokenShared(() => {
@@ -302,12 +364,98 @@ function firstTerminalLeafId(node: LayoutNode | null): string | null {
   return firstTerminalLeafId(node.first) ?? firstTerminalLeafId(node.second);
 }
 
+function createFlatSidebarState(sessionIds: string[]): SidebarState {
+  return {
+    folders: [],
+    items: sessionIds.map((id) => ({ type: "session", id })),
+  };
+}
+
+function normalizeSidebarState(
+  sidebar: SidebarState,
+  sessionIds: string[]
+): SidebarState {
+  const knownSessionIds = new Set(sessionIds);
+  const assignedSessions = new Set<string>();
+  const folderIds = new Set<string>();
+  const folders: SidebarFolder[] = [];
+
+  for (const folder of sidebar.folders) {
+    if (!folder.id || folderIds.has(folder.id)) continue;
+    folderIds.add(folder.id);
+    const folderSessionIds: string[] = [];
+    for (const sessionId of folder.sessionIds) {
+      if (!knownSessionIds.has(sessionId) || assignedSessions.has(sessionId)) continue;
+      assignedSessions.add(sessionId);
+      folderSessionIds.push(sessionId);
+    }
+    folders.push({
+      id: folder.id,
+      name: folder.name,
+      collapsed: folder.collapsed,
+      sessionIds: folderSessionIds,
+    });
+  }
+
+  const displayedFolders = new Set<string>();
+  const items: SidebarItem[] = [];
+  for (const item of sidebar.items) {
+    if (item.type === "folder") {
+      if (!folderIds.has(item.id) || displayedFolders.has(item.id)) continue;
+      displayedFolders.add(item.id);
+      items.push(item);
+      continue;
+    }
+    if (!knownSessionIds.has(item.id) || assignedSessions.has(item.id)) continue;
+    assignedSessions.add(item.id);
+    items.push(item);
+  }
+
+  for (const folder of folders) {
+    if (!displayedFolders.has(folder.id)) {
+      items.push({ type: "folder", id: folder.id });
+    }
+  }
+  for (const sessionId of sessionIds) {
+    if (!assignedSessions.has(sessionId)) {
+      items.push({ type: "session", id: sessionId });
+    }
+  }
+
+  return { folders, items };
+}
+
+function sidebarDropTargetsEqual(
+  first: SidebarDropTarget | null,
+  second: SidebarDropTarget | null
+) {
+  if (first === second) return true;
+  if (!first || !second || first.type !== second.type) return false;
+  if (first.type === "top-level" && second.type === "top-level") {
+    return first.index === second.index;
+  }
+  if (first.type === "folder" && second.type === "folder") {
+    return first.folderId === second.folderId;
+  }
+  return (
+    first.type === "folder-content" &&
+    second.type === "folder-content" &&
+    first.folderId === second.folderId &&
+    first.index === second.index
+  );
+}
+
 function toPersistedState(
   sessions: Session[],
-  activeSessionId: string | null
+  activeSessionId: string | null,
+  sidebar: SidebarState
 ): PersistedState {
+  const normalizedSidebar = normalizeSidebarState(
+    sidebar,
+    sessions.map((session) => session.id)
+  );
   return {
-    version: 1,
+    version: 2,
     activeSessionId,
     sessions: sessions.map((s) => {
       const layout = stripAgentLeaves(s.layout);
@@ -327,6 +475,8 @@ function toPersistedState(
         layout,
       };
     }),
+    folders: normalizedSidebar.folders,
+    sidebarItems: normalizedSidebar.items,
   };
 }
 
@@ -349,7 +499,7 @@ function isLayoutNode(value: unknown): value is LayoutNode {
 function validatePersistedState(data: unknown): PersistedState | null {
   if (!data || typeof data !== "object") return null;
   const raw = data as Record<string, unknown>;
-  if (raw.version !== 1) return null;
+  if (raw.version !== 1 && raw.version !== 2) return null;
   if (!Array.isArray(raw.sessions) || raw.sessions.length === 0) return null;
 
   const sessions: PersistedSession[] = [];
@@ -404,45 +554,73 @@ function validatePersistedState(data: unknown): PersistedState | null {
     activeSessionId = sessions[sessions.length - 1]?.id ?? null;
   }
 
-  return { version: 1, activeSessionId, sessions };
+  if (raw.version === 1) {
+    const sidebar = createFlatSidebarState(sessions.map((session) => session.id));
+    return {
+      version: 2,
+      activeSessionId,
+      sessions,
+      folders: sidebar.folders,
+      sidebarItems: sidebar.items,
+    };
+  }
+
+  if (!Array.isArray(raw.folders) || !Array.isArray(raw.sidebarItems)) {
+    return null;
+  }
+
+  const folders: SidebarFolder[] = [];
+  for (const item of raw.folders) {
+    if (!item || typeof item !== "object") return null;
+    const folder = item as Record<string, unknown>;
+    if (
+      typeof folder.id !== "string" ||
+      typeof folder.name !== "string" ||
+      typeof folder.collapsed !== "boolean" ||
+      !Array.isArray(folder.sessionIds) ||
+      !folder.sessionIds.every((id) => typeof id === "string")
+    ) {
+      return null;
+    }
+    folders.push({
+      id: folder.id,
+      name: folder.name,
+      collapsed: folder.collapsed,
+      sessionIds: folder.sessionIds as string[],
+    });
+  }
+
+  const sidebarItems: SidebarItem[] = [];
+  for (const item of raw.sidebarItems) {
+    if (!item || typeof item !== "object") return null;
+    const sidebarItem = item as Record<string, unknown>;
+    if (
+      typeof sidebarItem.id !== "string" ||
+      (sidebarItem.type !== "session" && sidebarItem.type !== "folder")
+    ) {
+      return null;
+    }
+    sidebarItems.push({
+      type: sidebarItem.type,
+      id: sidebarItem.id,
+    });
+  }
+
+  const sidebar = normalizeSidebarState(
+    { folders, items: sidebarItems },
+    sessions.map((session) => session.id)
+  );
+  return {
+    version: 2,
+    activeSessionId,
+    sessions,
+    folders: sidebar.folders,
+    sidebarItems: sidebar.items,
+  };
 }
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
-}
-
-function clampFontSize(size: number) {
-  return clamp(size, MIN_FONT_SIZE, MAX_FONT_SIZE);
-}
-
-function loadStoredFontSize(): number {
-  try {
-    const raw = localStorage.getItem(FONT_SIZE_STORAGE_KEY);
-    if (!raw) return DEFAULT_FONT_SIZE;
-    const parsed = Number.parseInt(raw, 10);
-    if (!Number.isFinite(parsed)) return DEFAULT_FONT_SIZE;
-    return clampFontSize(parsed);
-  } catch {
-    return DEFAULT_FONT_SIZE;
-  }
-}
-
-function storeFontSize(size: number) {
-  try {
-    localStorage.setItem(FONT_SIZE_STORAGE_KEY, String(size));
-  } catch {
-    // ignore
-  }
-}
-
-function applyTerminalFontSize(win: Win, size: number) {
-  try {
-    win.term.options.fontSize = size;
-    win.term.clearTextureAtlas();
-    fitAndRefresh(win);
-  } catch {
-    // ignore
-  }
 }
 
 function firstLeafId(node: LayoutNode | null): string | null {
@@ -873,6 +1051,8 @@ function TiledNode({
   onCancelDictation,
   panesProvider,
   orchestrator,
+  aiSettings,
+  onOpenAiSettings,
 }: {
   node: LayoutNode;
   session: Session;
@@ -888,6 +1068,8 @@ function TiledNode({
   onResizeSplit: (splitId: string, deltaRatio: number) => void;
   onLaunchAi: (paneId: string, shortcut: AiShortcut) => void;
   dictation: PaneDictationState | null;
+  aiSettings: AiSettings;
+  onOpenAiSettings: () => void;
   onToggleDictation: (paneId: string) => void;
   onCancelDictation: () => void;
   panesProvider: () => PaneInfo[];
@@ -929,6 +1111,8 @@ function TiledNode({
               folder={session.folder}
               panes={panesProvider}
               orchestrator={orchestrator}
+              aiSettings={aiSettings}
+              onOpenAiSettings={onOpenAiSettings}
             />
           </div>
         </div>
@@ -1033,6 +1217,8 @@ function TiledNode({
           onCancelDictation={onCancelDictation}
           panesProvider={panesProvider}
           orchestrator={orchestrator}
+          aiSettings={aiSettings}
+          onOpenAiSettings={onOpenAiSettings}
         />
       </div>
       <TilingDivider
@@ -1056,6 +1242,8 @@ function TiledNode({
           onCancelDictation={onCancelDictation}
           panesProvider={panesProvider}
           orchestrator={orchestrator}
+          aiSettings={aiSettings}
+          onOpenAiSettings={onOpenAiSettings}
         />
       </div>
     </div>
@@ -1063,26 +1251,68 @@ function TiledNode({
 }
 
 function App() {
+  const appSettings = useAppSettings();
+  const {
+    settings,
+    settingsRef,
+    ready: settingsReady,
+    settingsOpen,
+    openSettings,
+    setFontSize: setSettingsFontSize,
+    setSidebarCollapsed,
+    setSidebarLayout,
+    setWindowGeometry,
+    flushPersist: flushSettingsPersist,
+  } = appSettings;
+
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [sidebar, setSidebar] = useState<SidebarState>({
+    folders: [],
+    items: [],
+  });
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [paneDrag, setPaneDrag] = useState<PaneDragState | null>(null);
+  const [sidebarDrag, setSidebarDrag] = useState<SidebarDragState | null>(null);
   const [ptyListenersReady, setPtyListenersReady] = useState(false);
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(
     null
   );
+  const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
-  const [fontSize, setFontSize] = useState<number>(loadStoredFontSize);
   const [agentToasts, setAgentToasts] = useState<AgentToast[]>([]);
   const [blinkingPanes, setBlinkingPanes] = useState<Set<string>>(new Set());
   const [paneDictation, setPaneDictation] = useState<PaneDictationState | null>(null);
+  const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  const headerMenuRef = useRef<HTMLDivElement | null>(null);
+  const [sidebarResizing, setSidebarResizing] = useState(false);
+  /** Live width while dragging (null = use settings). */
+  const [sidebarDragWidth, setSidebarDragWidth] = useState<number | null>(null);
+  const sidebarResizeRef = useRef<{
+    startX: number;
+    startWidth: number;
+    wasCollapsed: boolean;
+  } | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    message: string;
+  } | null>(null);
+  const confirmResolverRef = useRef<((ok: boolean) => void) | null>(null);
 
   const sessionsRef = useRef<Session[]>([]);
+  const sidebarRef = useRef<SidebarState>(sidebar);
   const activeSessionRef = useRef<string | null>(null);
   const initRef = useRef(false);
+  const windowGeometryRestoredRef = useRef(false);
+  const windowGeometryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
   const restoringRef = useRef(false);
   const closingRef = useRef(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const paneDragRef = useRef<PaneDragSession | null>(null);
+  const sidebarDragRef = useRef<SidebarDragState | null>(null);
+  const sidebarPointerDragRef = useRef<SidebarPointerDragSession | null>(null);
+  const sidebarSuppressClickRef = useRef(false);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const pendingOutputRef = useRef<Map<string, string>>(new Map());
   const pendingExitRef = useRef<Set<string>>(new Set());
@@ -1110,11 +1340,183 @@ function App() {
   const paneDictationLevelFrameRef = useRef<number | null>(null);
   const paneDictationLevelDataRef = useRef<Uint8Array | null>(null);
   const handlePtyExitRef = useRef<(ptyId: string) => void>(() => {});
-  const fontSizeRef = useRef<number>(fontSize);
 
   sessionsRef.current = sessions;
+  sidebarRef.current = sidebar;
   activeSessionRef.current = activeSessionId;
-  fontSizeRef.current = fontSize;
+
+  const fontSize = settings.terminal.fontSize;
+  const sidebarCollapsed =
+    sidebarDragWidth !== null
+      ? sidebarDragWidth <= SIDEBAR_COLLAPSE_THRESHOLD
+      : settings.general.sidebarCollapsed;
+  const sidebarWidthPx = (() => {
+    if (sidebarDragWidth !== null) {
+      return sidebarCollapsed
+        ? COLLAPSED_SIDEBAR_WIDTH
+        : clamp(sidebarDragWidth, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    }
+    return sidebarCollapsed
+      ? COLLAPSED_SIDEBAR_WIDTH
+      : clamp(settings.general.sidebarWidth, MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+  })();
+
+  const beginSidebarResize = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const startWidth = settingsRef.current.general.sidebarCollapsed
+        ? COLLAPSED_SIDEBAR_WIDTH
+        : settingsRef.current.general.sidebarWidth;
+      sidebarResizeRef.current = {
+        startX: event.clientX,
+        startWidth,
+        wasCollapsed: settingsRef.current.general.sidebarCollapsed,
+      };
+      setSidebarResizing(true);
+      setSidebarDragWidth(startWidth);
+      setHeaderMenuOpen(false);
+
+      const target = event.currentTarget;
+      target.setPointerCapture(event.pointerId);
+
+      const onMove = (e: PointerEvent) => {
+        const drag = sidebarResizeRef.current;
+        if (!drag) return;
+        const next = drag.startWidth + (e.clientX - drag.startX);
+        setSidebarDragWidth(next);
+      };
+
+      const onUp = (e: PointerEvent) => {
+        const drag = sidebarResizeRef.current;
+        sidebarResizeRef.current = null;
+        setSidebarResizing(false);
+        try {
+          target.releasePointerCapture(e.pointerId);
+        } catch {
+          // ignore
+        }
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onUp);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+
+        if (!drag) {
+          setSidebarDragWidth(null);
+          return;
+        }
+        const raw = drag.startWidth + (e.clientX - drag.startX);
+        if (raw < SIDEBAR_COLLAPSE_THRESHOLD) {
+          // Keep last expanded width so reopening restores size.
+          setSidebarLayout({ collapsed: true });
+        } else {
+          const width = clamp(Math.round(raw), MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+          setSidebarLayout({ collapsed: false, width });
+        }
+        setSidebarDragWidth(null);
+      };
+
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onUp);
+    },
+    [setSidebarLayout, settingsRef]
+  );
+
+  const requestConfirm = useCallback((title: string, message: string) => {
+    return new Promise<boolean>((resolve) => {
+      // Resolve any previous pending confirm as cancelled.
+      confirmResolverRef.current?.(false);
+      confirmResolverRef.current = resolve;
+      setConfirmDialog({ title, message });
+    });
+  }, []);
+
+  const resolveConfirm = useCallback((ok: boolean) => {
+    const resolve = confirmResolverRef.current;
+    confirmResolverRef.current = null;
+    setConfirmDialog(null);
+    resolve?.(ok);
+  }, []);
+
+  // Escape cancels the in-app confirm dialog.
+  useEffect(() => {
+    if (!confirmDialog) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        resolveConfirm(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [confirmDialog, resolveConfirm]);
+
+  useEffect(() => {
+    if (!headerMenuOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const root = headerMenuRef.current;
+      if (!root) return;
+      if (event.target instanceof Node && !root.contains(event.target)) {
+        setHeaderMenuOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setHeaderMenuOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [headerMenuOpen]);
+
+  const collectAliveWindows = useCallback((): Win[] => {
+    const wins: Win[] = [];
+    for (const s of sessionsRef.current) {
+      for (const w of s.windows) {
+        if (w.alive) wins.push(w);
+      }
+    }
+    return wins;
+  }, []);
+
+  const applyAppearanceToAll = useCallback(() => {
+    const s = settingsRef.current;
+    const opts = {
+      themeId: s.appearance.theme,
+      fontFamily: s.terminal.fontFamily,
+      fontSize: s.terminal.fontSize,
+      colorMode: s.terminal.colorMode,
+      colors: s.terminal.colors,
+    };
+    for (const w of collectAliveWindows()) {
+      applyTerminalAppearance(w, opts, (win) => fitAndRefresh(win as Win));
+    }
+  }, [collectAliveWindows, settingsRef]);
+
+  // Live-update terminals when theme / font / colors change.
+  useEffect(() => {
+    if (!settingsReady) return;
+    applyAppearanceToAll();
+  }, [
+    settingsReady,
+    settings.appearance.theme,
+    settings.terminal.fontFamily,
+    settings.terminal.fontSize,
+    settings.terminal.colorMode,
+    settings.terminal.colors.foreground,
+    settings.terminal.colors.background,
+    settings.terminal.colors.cursor,
+    settings.terminal.colors.selectionBackground,
+    applyAppearanceToAll,
+  ]);
 
   const findWinByPaneId = useCallback((paneId: string): Win | null => {
     for (const session of sessionsRef.current) {
@@ -1633,17 +2035,21 @@ function App() {
   const createWin = useCallback(
     async (cwd?: string | null, paneId?: string): Promise<Win> => {
       const id = await invoke<string>("spawn_powershell", { cwd: cwd ?? null });
+      const s = settingsRef.current;
+      const fontFamily = await ensureFontStackReady(s.terminal.fontFamily).catch(
+        () => s.terminal.fontFamily
+      );
       const term = new Terminal({
-        fontFamily: "Cascadia Code, Consolas, Courier New, monospace",
-        fontSize: fontSizeRef.current,
+        fontFamily,
+        fontSize: s.terminal.fontSize,
         cursorBlink: true,
         scrollback: 10000,
         windowsPty: { backend: "conpty" },
-        theme: {
-          background: "#1e1e1e",
-          foreground: "#cccccc",
-          cursor: "#ffffff",
-        },
+        theme: resolveTerminalTheme(
+          s.appearance.theme,
+          s.terminal.colorMode,
+          s.terminal.colors
+        ),
       });
       const fitAddon = new FitAddon();
       term.loadAddon(fitAddon);
@@ -1659,7 +2065,7 @@ function App() {
         alive: true,
       };
     },
-    [handleTerminalInput]
+    [handleTerminalInput, settingsRef]
   );
 
   const restartWin = useCallback(async (paneId: string) => {
@@ -1765,6 +2171,15 @@ function App() {
       folder: folder ?? null,
     };
     setSessions((prev) => [...prev, session]);
+    setSidebar((prev) =>
+      normalizeSidebarState(
+        {
+          ...prev,
+          items: [...prev.items, { type: "session", id: session.id }],
+        },
+        [...sessionsRef.current.map((candidate) => candidate.id), session.id]
+      )
+    );
     setActiveSessionId(session.id);
   }, [createWin]);
 
@@ -1799,6 +2214,15 @@ function App() {
         }
 
         setSessions(restored);
+        setSidebar(
+          normalizeSidebarState(
+            {
+              folders: persisted.folders,
+              items: persisted.sidebarItems,
+            },
+            restored.map((session) => session.id)
+          )
+        );
         const activeId = persisted.sessions.some(
           (session) => session.id === persisted.activeSessionId
         )
@@ -1816,7 +2240,8 @@ function App() {
     if (restoringRef.current || sessionsRef.current.length === 0) return;
     const state = toPersistedState(
       sessionsRef.current,
-      activeSessionRef.current
+      activeSessionRef.current,
+      sidebarRef.current
     );
     void invoke("save_sessions", { state });
   }, []);
@@ -1981,24 +2406,21 @@ function App() {
     [clearAgentTracking]
   );
 
-  const applyFontSizeAll = useCallback((size: number) => {
-    const next = clampFontSize(size);
-    setFontSize(next);
-    storeFontSize(next);
-    for (const s of sessionsRef.current) {
-      for (const w of s.windows) {
-        if (w.alive) applyTerminalFontSize(w, next);
-      }
-    }
-  }, []);
+  const applyFontSizeAll = useCallback(
+    (size: number) => {
+      const next = clampFontSize(size);
+      setSettingsFontSize(next);
+    },
+    [setSettingsFontSize]
+  );
 
   const zoomFontIn = useCallback(() => {
-    applyFontSizeAll(fontSizeRef.current + 1);
-  }, [applyFontSizeAll]);
+    applyFontSizeAll(settingsRef.current.terminal.fontSize + 1);
+  }, [applyFontSizeAll, settingsRef]);
 
   const zoomFontOut = useCallback(() => {
-    applyFontSizeAll(fontSizeRef.current - 1);
-  }, [applyFontSizeAll]);
+    applyFontSizeAll(settingsRef.current.terminal.fontSize - 1);
+  }, [applyFontSizeAll, settingsRef]);
 
   const resetFontSize = useCallback(() => {
     applyFontSizeAll(DEFAULT_FONT_SIZE);
@@ -2093,83 +2515,122 @@ function App() {
     );
   }, []);
 
-  const closeWindow = useCallback((paneId: string) => {
-    stopBlinkingPane(paneId);
+  const closeWindow = useCallback(
+    async (paneId: string) => {
+      if (settingsRef.current.general.confirmClosePane) {
+        const ok = await requestConfirm(
+          "Close pane",
+          "Close this pane? Any running process will be stopped."
+        );
+        if (!ok) return;
+      }
 
-    // Agent panes have no Win/PTY; just remove them from the layout.
-    let isAgentPane = false;
-    for (const s of sessionsRef.current) {
-      const leaf = findLeafById(s.layout, paneId);
-      if (leaf?.kind === "agent") {
-        isAgentPane = true;
+      stopBlinkingPane(paneId);
+
+      // Agent panes have no Win/PTY; just remove them from the layout.
+      let isAgentPane = false;
+      for (const s of sessionsRef.current) {
+        const leaf = findLeafById(s.layout, paneId);
+        if (leaf?.kind === "agent") {
+          isAgentPane = true;
+          break;
+        }
+      }
+      if (isAgentPane) {
+        setSessions((prev) =>
+          prev.map((session) => {
+            if (!containsLeafId(session.layout, paneId)) return session;
+            const layout = removeWindow(session.layout, paneId);
+            const activeWinId =
+              session.activeWinId === paneId
+                ? firstLeafId(layout)
+                : session.activeWinId;
+            return { ...session, layout, activeWinId };
+          })
+        );
+        return;
+      }
+
+      for (const s of sessionsRef.current) {
+        const w = s.windows.find((x) => x.paneId === paneId);
+        if (!w) continue;
+        clearPtyTransientState(w.id);
+        cancelScheduledFit(w.paneId);
+        intentionalKillRef.current.add(w.id);
+        clearSyncedPtySize(w.id);
+        void invoke("kill_powershell", { id: w.id });
+        w.onResizeDispose();
+        w.onDataDispose();
+        w.term.dispose();
+        setSessions((prev) =>
+          prev.map((session) => {
+            if (!session.windows.some((x) => x.paneId === paneId)) return session;
+            const layout = removeWindow(session.layout, paneId);
+            const activeWinId =
+              session.activeWinId === paneId
+                ? firstLeafId(layout)
+                : session.activeWinId;
+
+            return {
+              ...session,
+              windows: session.windows.filter((x) => x.paneId !== paneId),
+              layout,
+              activeWinId,
+            };
+          })
+        );
         break;
       }
-    }
-    if (isAgentPane) {
-      setSessions((prev) =>
-        prev.map((session) => {
-          if (!containsLeafId(session.layout, paneId)) return session;
-          const layout = removeWindow(session.layout, paneId);
-          const activeWinId =
-            session.activeWinId === paneId ? firstLeafId(layout) : session.activeWinId;
-          return { ...session, layout, activeWinId };
-        })
+    },
+    [clearPtyTransientState, requestConfirm, settingsRef, stopBlinkingPane]
+  );
+
+  const closeSession = useCallback(
+    async (sessionId: string) => {
+      const sess = sessionsRef.current.find((s) => s.id === sessionId);
+      if (!sess) return;
+
+      if (settingsRef.current.general.confirmCloseSession) {
+        const ok = await requestConfirm(
+          "Close session",
+          `Close session “${sess.name}”? All panes in this session will be stopped.`
+        );
+        if (!ok) return;
+      }
+
+      for (const w of sess.windows) {
+        stopBlinkingPane(w.paneId);
+        clearPtyTransientState(w.id);
+        cancelScheduledFit(w.paneId);
+        intentionalKillRef.current.add(w.id);
+        clearSyncedPtySize(w.id);
+        void invoke("kill_powershell", { id: w.id });
+        w.onResizeDispose();
+        w.onDataDispose();
+        w.term.dispose();
+      }
+      const remaining = sessionsRef.current.filter((s) => s.id !== sessionId);
+      setSessions(remaining);
+      setSidebar((prev) =>
+        normalizeSidebarState(
+          {
+            folders: prev.folders.map((folder) => ({
+              ...folder,
+              sessionIds: folder.sessionIds.filter((id) => id !== sessionId),
+            })),
+            items: prev.items.filter(
+              (item) => item.type !== "session" || item.id !== sessionId
+            ),
+          },
+          remaining.map((session) => session.id)
+        )
       );
-      return;
-    }
-
-    for (const s of sessionsRef.current) {
-      const w = s.windows.find((x) => x.paneId === paneId);
-      if (!w) continue;
-      clearPtyTransientState(w.id);
-      cancelScheduledFit(w.paneId);
-      intentionalKillRef.current.add(w.id);
-      clearSyncedPtySize(w.id);
-      void invoke("kill_powershell", { id: w.id });
-      w.onResizeDispose();
-      w.onDataDispose();
-      w.term.dispose();
-      setSessions((prev) =>
-        prev.map((session) => {
-          if (!session.windows.some((x) => x.paneId === paneId)) return session;
-          const layout = removeWindow(session.layout, paneId);
-          const activeWinId =
-            session.activeWinId === paneId
-              ? firstLeafId(layout)
-              : session.activeWinId;
-
-          return {
-            ...session,
-            windows: session.windows.filter((x) => x.paneId !== paneId),
-            layout,
-            activeWinId,
-          };
-        })
-      );
-      break;
-    }
-  }, [clearPtyTransientState, stopBlinkingPane]);
-
-  const closeSession = useCallback((sessionId: string) => {
-    const sess = sessionsRef.current.find((s) => s.id === sessionId);
-    if (!sess) return;
-    for (const w of sess.windows) {
-      stopBlinkingPane(w.paneId);
-      clearPtyTransientState(w.id);
-      cancelScheduledFit(w.paneId);
-      intentionalKillRef.current.add(w.id);
-      clearSyncedPtySize(w.id);
-      void invoke("kill_powershell", { id: w.id });
-      w.onResizeDispose();
-      w.onDataDispose();
-      w.term.dispose();
-    }
-    const remaining = sessionsRef.current.filter((s) => s.id !== sessionId);
-    setSessions(remaining);
-    if (activeSessionRef.current === sessionId) {
-      setActiveSessionId(remaining[remaining.length - 1]?.id ?? null);
-    }
-  }, [clearPtyTransientState, stopBlinkingPane]);
+      if (activeSessionRef.current === sessionId) {
+        setActiveSessionId(remaining[remaining.length - 1]?.id ?? null);
+      }
+    },
+    [clearPtyTransientState, requestConfirm, settingsRef, stopBlinkingPane]
+  );
 
   const swapPanes = useCallback((fromId: string, toId: string) => {
     if (fromId === toId) return;
@@ -2197,6 +2658,7 @@ function App() {
         );
       }
       setRenamingSessionId(null);
+      setRenamingFolderId(null);
       setRenameDraft("");
     },
     [renameDraft]
@@ -2204,16 +2666,353 @@ function App() {
 
   const cancelRename = useCallback(() => {
     setRenamingSessionId(null);
+    setRenamingFolderId(null);
     setRenameDraft("");
   }, []);
 
   const beginRename = useCallback((sessionId: string, currentName: string) => {
+    setRenamingFolderId(null);
     setRenamingSessionId(sessionId);
     setRenameDraft(currentName);
   }, []);
 
+  const commitFolderRename = useCallback(
+    (folderId: string) => {
+      const trimmed = renameDraft.trim();
+      if (trimmed) {
+        setSidebar((prev) => ({
+          ...prev,
+          folders: prev.folders.map((folder) =>
+            folder.id === folderId ? { ...folder, name: trimmed } : folder
+          ),
+        }));
+      }
+      setRenamingSessionId(null);
+      setRenamingFolderId(null);
+      setRenameDraft("");
+    },
+    [renameDraft]
+  );
+
+  const beginFolderRename = useCallback((folderId: string, currentName: string) => {
+    setRenamingSessionId(null);
+    setRenamingFolderId(folderId);
+    setRenameDraft(currentName);
+  }, []);
+
+  const createSidebarFolder = useCallback(() => {
+    const id = createSidebarFolderId();
+    const folder: SidebarFolder = {
+      id,
+      name: "New folder",
+      collapsed: false,
+      sessionIds: [],
+    };
+    setSidebar((prev) =>
+      normalizeSidebarState(
+        {
+          folders: [...prev.folders, folder],
+          items: [...prev.items, { type: "folder", id }],
+        },
+        sessionsRef.current.map((session) => session.id)
+      )
+    );
+    setRenamingSessionId(null);
+    setRenamingFolderId(id);
+    setRenameDraft(folder.name);
+  }, []);
+
+  const toggleSidebarFolder = useCallback((folderId: string) => {
+    setSidebar((prev) => ({
+      ...prev,
+      folders: prev.folders.map((folder) =>
+        folder.id === folderId
+          ? { ...folder, collapsed: !folder.collapsed }
+          : folder
+      ),
+    }));
+  }, []);
+
+  const deleteSidebarFolder = useCallback((folderId: string) => {
+    setSidebar((prev) => {
+      const folder = prev.folders.find((candidate) => candidate.id === folderId);
+      if (!folder) return prev;
+      const index = prev.items.findIndex(
+        (item) => item.type === "folder" && item.id === folderId
+      );
+      const items = prev.items.filter(
+        (item) => item.type !== "folder" || item.id !== folderId
+      );
+      items.splice(
+        index < 0 ? items.length : index,
+        0,
+        ...folder.sessionIds.map((id) => ({ type: "session" as const, id }))
+      );
+      return normalizeSidebarState(
+        {
+          folders: prev.folders.filter((candidate) => candidate.id !== folderId),
+          items,
+        },
+        sessionsRef.current.map((session) => session.id)
+      );
+    });
+    if (renamingFolderId === folderId) {
+      setRenamingFolderId(null);
+      setRenameDraft("");
+    }
+  }, [renamingFolderId]);
+
+  const moveSidebarSession = useCallback(
+    (sessionId: string, target: SidebarDropTarget) => {
+      setSidebar((prev) => {
+        const sourceTopLevelIndex = prev.items.findIndex(
+          (item) => item.type === "session" && item.id === sessionId
+        );
+        const sourceFolder = prev.folders.find((folder) =>
+          folder.sessionIds.includes(sessionId)
+        );
+        const folders = prev.folders.map((folder) => ({
+          ...folder,
+          sessionIds: folder.sessionIds.filter((id) => id !== sessionId),
+        }));
+        const items = prev.items.filter(
+          (item) => item.type !== "session" || item.id !== sessionId
+        );
+
+        if (target.type === "top-level") {
+          let index = target.index;
+          if (sourceTopLevelIndex >= 0 && sourceTopLevelIndex < index) index -= 1;
+          items.splice(clamp(index, 0, items.length), 0, {
+            type: "session",
+            id: sessionId,
+          });
+        } else if (target.type === "folder") {
+          const folder = folders.find((candidate) => candidate.id === target.folderId);
+          if (!folder) return prev;
+          folder.sessionIds.push(sessionId);
+        } else {
+          const folder = folders.find((candidate) => candidate.id === target.folderId);
+          if (!folder) return prev;
+          let index = target.index;
+          const sourceIndex =
+            sourceFolder?.id === folder.id
+              ? sourceFolder.sessionIds.indexOf(sessionId)
+              : -1;
+          if (sourceIndex >= 0 && sourceIndex < index) index -= 1;
+          folder.sessionIds.splice(clamp(index, 0, folder.sessionIds.length), 0, sessionId);
+        }
+
+        return normalizeSidebarState(
+          { folders, items },
+          sessionsRef.current.map((session) => session.id)
+        );
+      });
+    },
+    []
+  );
+
+  const moveSidebarFolder = useCallback((folderId: string, targetIndex: number) => {
+    setSidebar((prev) => {
+      const sourceIndex = prev.items.findIndex(
+        (item) => item.type === "folder" && item.id === folderId
+      );
+      if (sourceIndex < 0) return prev;
+      const items = prev.items.filter(
+        (item) => item.type !== "folder" || item.id !== folderId
+      );
+      const index = sourceIndex < targetIndex ? targetIndex - 1 : targetIndex;
+      items.splice(clamp(index, 0, items.length), 0, {
+        type: "folder",
+        id: folderId,
+      });
+      return { ...prev, items };
+    });
+  }, []);
+
+  const setCurrentSidebarDrag = useCallback((drag: SidebarDragState | null) => {
+    sidebarDragRef.current = drag;
+    setSidebarDrag(drag);
+  }, []);
+
+  const applySidebarDrop = useCallback(
+    (drag: SidebarDragState, target: SidebarDropTarget) => {
+      if (drag.kind === "session") {
+        moveSidebarSession(drag.id, target);
+      } else if (target.type === "top-level") {
+        moveSidebarFolder(drag.id, target.index);
+      }
+    },
+    [moveSidebarFolder, moveSidebarSession]
+  );
+
+  const getSidebarDropTargetFromPoint = useCallback(
+    (
+      clientX: number,
+      clientY: number,
+      drag: SidebarPointerDragSession
+    ): SidebarDropTarget | null => {
+      const element = document.elementFromPoint(clientX, clientY);
+      const dropElement = element?.closest("[data-sidebar-drop]") as HTMLElement | null;
+      if (dropElement) {
+        const topLevelIndex = Number.parseInt(
+          dropElement.dataset.sidebarTopIndex ?? "",
+          10
+        );
+        if (!Number.isFinite(topLevelIndex)) return null;
+        const folderId = dropElement.dataset.sidebarFolderId;
+        const rect = dropElement.getBoundingClientRect();
+        const after = clientY >= rect.top + rect.height / 2;
+
+        if (dropElement.dataset.sidebarDrop === "session") {
+          const folderIndex = Number.parseInt(
+            dropElement.dataset.sidebarFolderIndex ?? "",
+            10
+          );
+          if (drag.kind === "folder" || !folderId || !Number.isFinite(folderIndex)) {
+            return { type: "top-level", index: topLevelIndex + (after ? 1 : 0) };
+          }
+          return {
+            type: "folder-content",
+            folderId,
+            index: folderIndex + (after ? 1 : 0),
+          };
+        }
+
+        if (dropElement.dataset.sidebarDrop === "folder") {
+          if (!folderId) return null;
+          const offset = clientY - rect.top;
+          const edge = Math.min(10, rect.height * 0.3);
+          if (drag.kind === "folder" || offset <= edge) {
+            return { type: "top-level", index: topLevelIndex };
+          }
+          if (offset >= rect.height - edge) {
+            return { type: "top-level", index: topLevelIndex + 1 };
+          }
+          return { type: "folder", folderId };
+        }
+
+        if (dropElement.dataset.sidebarDrop === "folder-content") {
+          if (drag.kind === "folder") {
+            return { type: "top-level", index: topLevelIndex + 1 };
+          }
+          const folderIndex = Number.parseInt(
+            dropElement.dataset.sidebarFolderIndex ?? "",
+            10
+          );
+          if (!folderId || !Number.isFinite(folderIndex)) return null;
+          return { type: "folder-content", folderId, index: folderIndex };
+        }
+      }
+
+      const list = element?.closest("[data-sidebar-list]") as HTMLElement | null;
+      if (!list) return null;
+      const itemCount = Number.parseInt(list.dataset.sidebarItemCount ?? "", 10);
+      return Number.isFinite(itemCount)
+        ? { type: "top-level", index: itemCount }
+        : null;
+    },
+    []
+  );
+
+  const beginSidebarPointerDrag = useCallback(
+    (
+      kind: SidebarDragState["kind"],
+      id: string,
+      event: React.PointerEvent<HTMLElement>
+    ) => {
+      if (event.button !== 0 || (event.target as HTMLElement).closest("button, input")) {
+        return;
+      }
+
+      const drag: SidebarPointerDragSession = {
+        kind,
+        id,
+        startX: event.clientX,
+        startY: event.clientY,
+        active: false,
+        target: null,
+      };
+      sidebarPointerDragRef.current = drag;
+
+      const clearPointerStyles = () => {
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      };
+
+      const cleanup = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onCancel);
+        clearPointerStyles();
+      };
+
+      const onMove = (moveEvent: PointerEvent) => {
+        const current = sidebarPointerDragRef.current;
+        if (!current) return;
+
+        if (!current.active) {
+          const distance = Math.hypot(
+            moveEvent.clientX - current.startX,
+            moveEvent.clientY - current.startY
+          );
+          if (distance < dragStartDistance) return;
+          current.active = true;
+          document.body.style.cursor = "grabbing";
+          document.body.style.userSelect = "none";
+        }
+
+        const target = getSidebarDropTargetFromPoint(
+          moveEvent.clientX,
+          moveEvent.clientY,
+          current
+        );
+        current.target = target;
+        const currentState = sidebarDragRef.current;
+        if (
+          !currentState ||
+          currentState.kind !== current.kind ||
+          currentState.id !== current.id ||
+          !sidebarDropTargetsEqual(currentState.target, target)
+        ) {
+          setCurrentSidebarDrag({
+            kind: current.kind,
+            id: current.id,
+            target,
+          });
+        }
+      };
+
+      const onUp = () => {
+        const current = sidebarPointerDragRef.current;
+        if (current?.active) {
+          if (current.target) {
+            applySidebarDrop(current, current.target);
+          }
+          sidebarSuppressClickRef.current = true;
+          window.setTimeout(() => {
+            sidebarSuppressClickRef.current = false;
+          }, 0);
+        }
+        sidebarPointerDragRef.current = null;
+        setCurrentSidebarDrag(null);
+        cleanup();
+      };
+
+      const onCancel = () => {
+        sidebarPointerDragRef.current = null;
+        setCurrentSidebarDrag(null);
+        cleanup();
+      };
+
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onCancel);
+    },
+    [applySidebarDrop, getSidebarDropTargetFromPoint, setCurrentSidebarDrag]
+  );
+
   useEffect(() => {
-    if (!renamingSessionId) return;
+    if (!renamingSessionId && !renamingFolderId) return;
     const frame = window.requestAnimationFrame(() => {
       const input = renameInputRef.current;
       if (!input) return;
@@ -2221,7 +3020,7 @@ function App() {
       input.select();
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [renamingSessionId]);
+  }, [renamingFolderId, renamingSessionId]);
 
   const resizeSplit = useCallback((splitId: string, deltaRatio: number) => {
     const sid = activeSessionRef.current;
@@ -2321,7 +3120,7 @@ function App() {
   );
 
   useEffect(() => {
-    if (initRef.current || !ptyListenersReady) return;
+    if (initRef.current || !ptyListenersReady || !settingsReady) return;
     initRef.current = true;
     void (async () => {
       try {
@@ -2336,7 +3135,89 @@ function App() {
         await createSession();
       }
     })();
-  }, [createSession, ptyListenersReady, restoreSessions]);
+  }, [createSession, ptyListenersReady, restoreSessions, settingsReady]);
+
+  // Restore window size/position once settings are ready.
+  useEffect(() => {
+    if (!settingsReady || windowGeometryRestoredRef.current) return;
+    windowGeometryRestoredRef.current = true;
+    const geom = settingsRef.current.general.window;
+    void (async () => {
+      try {
+        const win = getCurrentWindow();
+        await win.setSize(new LogicalSize(geom.width, geom.height));
+        if (geom.x !== null && geom.y !== null) {
+          await win.setPosition(new LogicalPosition(geom.x, geom.y));
+        }
+      } catch {
+        // ignore restore failures
+      }
+    })();
+  }, [settingsReady, settingsRef]);
+
+  // Persist window geometry on move/resize.
+  useEffect(() => {
+    if (!settingsReady) return;
+    let unlistenResize: UnlistenFn | null = null;
+    let unlistenMove: UnlistenFn | null = null;
+    let cancelled = false;
+
+    const captureGeometry = async () => {
+      try {
+        const win = getCurrentWindow();
+        const size = await win.innerSize();
+        const pos = await win.outerPosition();
+        const scale = await win.scaleFactor();
+        const width = Math.round(size.width / scale);
+        const height = Math.round(size.height / scale);
+        const x = Math.round(pos.x / scale);
+        const y = Math.round(pos.y / scale);
+        if (windowGeometryTimerRef.current) {
+          clearTimeout(windowGeometryTimerRef.current);
+        }
+        windowGeometryTimerRef.current = setTimeout(() => {
+          setWindowGeometry({
+            width: clamp(width, 400, 10000),
+            height: clamp(height, 300, 10000),
+            x,
+            y,
+          });
+        }, WINDOW_GEOMETRY_DEBOUNCE_MS);
+      } catch {
+        // ignore
+      }
+    };
+
+    void (async () => {
+      try {
+        const win = getCurrentWindow();
+        const offResize = await win.onResized(() => {
+          void captureGeometry();
+        });
+        const offMove = await win.onMoved(() => {
+          void captureGeometry();
+        });
+        if (cancelled) {
+          offResize();
+          offMove();
+        } else {
+          unlistenResize = offResize;
+          unlistenMove = offMove;
+        }
+      } catch {
+        // ignore
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      unlistenResize?.();
+      unlistenMove?.();
+      if (windowGeometryTimerRef.current) {
+        clearTimeout(windowGeometryTimerRef.current);
+      }
+    };
+  }, [settingsReady, setWindowGeometry]);
 
   useEffect(() => {
     if (restoringRef.current || !ptyListenersReady || !initRef.current) {
@@ -2351,7 +3232,7 @@ function App() {
     return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     };
-  }, [sessions, activeSessionId, flushSave, ptyListenersReady]);
+  }, [sessions, sidebar, activeSessionId, flushSave, ptyListenersReady]);
 
   useEffect(() => {
     let unlistenClose: UnlistenFn | null = null;
@@ -2365,10 +3246,29 @@ function App() {
         closingRef.current = true;
         const state = toPersistedState(
           sessionsRef.current,
-          activeSessionRef.current
+          activeSessionRef.current,
+          sidebarRef.current
         );
         try {
-          await invoke("save_sessions", { state });
+          // Capture latest window geometry before exit.
+          try {
+            const win = getCurrentWindow();
+            const size = await win.innerSize();
+            const pos = await win.outerPosition();
+            const scale = await win.scaleFactor();
+            setWindowGeometry({
+              width: clamp(Math.round(size.width / scale), 400, 10000),
+              height: clamp(Math.round(size.height / scale), 300, 10000),
+              x: Math.round(pos.x / scale),
+              y: Math.round(pos.y / scale),
+            });
+          } catch {
+            // ignore geometry capture
+          }
+          await Promise.all([
+            invoke("save_sessions", { state }),
+            flushSettingsPersist(),
+          ]);
         } catch {
           // Still allow the window to close if persistence fails.
         }
@@ -2382,7 +3282,7 @@ function App() {
       cancelled = true;
       unlistenClose?.();
     };
-  }, []);
+  }, [flushSettingsPersist, setWindowGeometry]);
 
   useEffect(() => {
     for (const s of sessions) {
@@ -2529,90 +3429,383 @@ function App() {
     return () => window.cancelAnimationFrame(frame);
   }, [activeSessionId, activeWindowIds, activeLayoutSignature]);
 
+  const sessionsById = useMemo(
+    () => new Map(sessions.map((session) => [session.id, session])),
+    [sessions]
+  );
+
+  const renderSessionRow = (
+    session: Session,
+    topLevelIndex: number,
+    folderId?: string,
+    folderIndex?: number
+  ) => {
+    const isRenaming = renamingSessionId === session.id;
+    const isDragging = sidebarDrag?.kind === "session" && sidebarDrag.id === session.id;
+    const dropTarget = sidebarDrag?.target;
+    const isFolderRow = folderId !== undefined && folderIndex !== undefined;
+    const isDropBefore = isFolderRow
+      ? dropTarget?.type === "folder-content" &&
+        dropTarget.folderId === folderId &&
+        dropTarget.index === folderIndex
+      : dropTarget?.type === "top-level" && dropTarget.index === topLevelIndex;
+    const isDropAfter = isFolderRow
+      ? dropTarget?.type === "folder-content" &&
+        dropTarget.folderId === folderId &&
+        dropTarget.index === folderIndex + 1
+      : dropTarget?.type === "top-level" && dropTarget.index === topLevelIndex + 1;
+    const aliveCount = session.windows.filter((win) => win.alive).length;
+
+    return (
+      <li
+        key={session.id}
+        className={`session-item ${
+          session.id === activeSessionId ? "active" : ""
+        } ${isFolderRow ? "nested" : ""} ${isDragging ? "dragging" : ""} ${
+          isDropBefore ? "drop-before" : ""
+        } ${isDropAfter ? "drop-after" : ""}`}
+        title={session.folder ?? ""}
+        data-sidebar-drop="session"
+        data-sidebar-top-index={topLevelIndex}
+        data-sidebar-folder-id={folderId}
+        data-sidebar-folder-index={folderIndex}
+        onPointerDown={(event) =>
+          beginSidebarPointerDrag("session", session.id, event)
+        }
+        onClick={(event) => {
+          if (sidebarSuppressClickRef.current) {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+          }
+          setActiveSessionId(session.id);
+        }}
+        onDoubleClick={(event) => {
+          event.stopPropagation();
+          beginRename(session.id, session.name);
+        }}
+      >
+        <span
+          className={`session-dot ${session.folder ? "linked" : ""}`}
+          title={session.folder ?? ""}
+        />
+        {isRenaming ? (
+          <input
+            ref={renameInputRef}
+            className="session-rename-input"
+            value={renameDraft}
+            onChange={(event) => setRenameDraft(event.target.value)}
+            onBlur={() => commitRename(session.id)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                commitRename(session.id);
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                cancelRename();
+              }
+            }}
+            onClick={(event) => event.stopPropagation()}
+            onDoubleClick={(event) => event.stopPropagation()}
+          />
+        ) : (
+          <span className="session-name">{session.name}</span>
+        )}
+        <span className="session-count">{aliveCount}</span>
+        <button
+          className="close-btn"
+          title="Close session"
+          onClick={(event) => {
+            event.stopPropagation();
+            void closeSession(session.id);
+          }}
+        >
+          ×
+        </button>
+      </li>
+    );
+  };
+
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+      <aside
+        className={`sidebar ${sidebarCollapsed ? "collapsed" : ""} ${
+          sidebarResizing ? "resizing" : ""
+        }`}
+        style={{
+          flexBasis: sidebarWidthPx,
+          width: sidebarWidthPx,
+        }}
+      >
         <header className="sidebar-header">
           <div className="brand-lockup">
-            <img src={appLogo} alt="" className="brand-logo" />
-            <span className="brand-title">Wraith</span>
-          </div>
-          <div className="sidebar-actions">
             <button
-              className="new-btn linked"
-              title="New linked session"
-              onClick={() => void createLinkedSession()}
+              type="button"
+              className="brand-toggle"
+              title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-expanded={!sidebarCollapsed}
+              onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
             >
-              📁
+              <img src={appLogo} alt="" className="brand-logo" />
+            </button>
+            {!sidebarCollapsed && <span className="brand-title">Wraith</span>}
+          </div>
+          {!sidebarCollapsed && (
+            <div className="sidebar-actions" ref={headerMenuRef}>
+              <button
+                type="button"
+                className={`new-btn menu-trigger ${headerMenuOpen ? "open" : ""}`}
+                title="Actions"
+                aria-label="Actions menu"
+                aria-haspopup="menu"
+                aria-expanded={headerMenuOpen}
+                onClick={() => setHeaderMenuOpen((open) => !open)}
+              >
+                ▾
+              </button>
+              {headerMenuOpen && (
+                <div className="sidebar-menu" role="menu">
+                  <button
+                    type="button"
+                    className="sidebar-menu-item"
+                    role="menuitem"
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      openSettings("appearance");
+                    }}
+                  >
+                    <span className="sidebar-menu-icon" aria-hidden="true">
+                      ⚙
+                    </span>
+                    <span>Settings</span>
+                  </button>
+                  <div className="sidebar-menu-sep" role="separator" />
+                  <button
+                    type="button"
+                    className="sidebar-menu-item"
+                    role="menuitem"
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      void createSession();
+                    }}
+                  >
+                    <span className="sidebar-menu-icon" aria-hidden="true">
+                      +
+                    </span>
+                    <span>New session</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="sidebar-menu-item"
+                    role="menuitem"
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      void createLinkedSession();
+                    }}
+                  >
+                    <span className="sidebar-menu-icon" aria-hidden="true">
+                      📁
+                    </span>
+                    <span>New linked session</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="sidebar-menu-item"
+                    role="menuitem"
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      createSidebarFolder();
+                    }}
+                  >
+                    <span className="sidebar-menu-icon folder" aria-hidden="true">
+                      <span className="header-folder-icon" />
+                    </span>
+                    <span>New folder</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </header>
+        {sidebarCollapsed ? (
+          <div className="sidebar-collapsed-rail">
+            <button
+              type="button"
+              className="sidebar-rail-btn"
+              title="Expand sidebar"
+              aria-label="Expand sidebar"
+              onClick={() => setSidebarCollapsed(false)}
+            >
+              ›
             </button>
             <button
-              className="new-btn"
+              type="button"
+              className="sidebar-rail-btn"
+              title="Settings"
+              aria-label="Settings"
+              onClick={() => openSettings("appearance")}
+            >
+              ⚙
+            </button>
+            <button
+              type="button"
+              className="sidebar-rail-btn accent"
               title="New session"
+              aria-label="New session"
               onClick={() => void createSession()}
             >
               +
             </button>
           </div>
-        </header>
-        <ul className="session-list">
-          {sessions.map((s) => {
-            const aliveCount = s.windows.filter((w) => w.alive).length;
-            const isRenaming = renamingSessionId === s.id;
+        ) : (
+        <ul
+          className="session-list"
+          data-sidebar-list
+          data-sidebar-item-count={sidebar.items.length}
+        >
+          {sidebar.items.map((item, topLevelIndex) => {
+            if (item.type === "session") {
+              const session = sessionsById.get(item.id);
+              return session
+                ? renderSessionRow(session, topLevelIndex)
+                : null;
+            }
+
+            const folder = sidebar.folders.find(
+              (candidate) => candidate.id === item.id
+            );
+            if (!folder) return null;
+            const folderSessions = folder.sessionIds
+              .map((sessionId) => sessionsById.get(sessionId))
+              .filter((session): session is Session => Boolean(session));
+            const paneCount = folderSessions.reduce(
+              (total, session) =>
+                total + session.windows.filter((win) => win.alive).length,
+              0
+            );
+            const isRenaming = renamingFolderId === folder.id;
+            const isDragging =
+              sidebarDrag?.kind === "folder" && sidebarDrag.id === folder.id;
+            const isDropInto =
+              sidebarDrag?.target?.type === "folder" &&
+              sidebarDrag.target.folderId === folder.id;
+            const isDropBefore =
+              sidebarDrag?.target?.type === "top-level" &&
+              sidebarDrag.target.index === topLevelIndex;
+            const isDropAfter =
+              sidebarDrag?.target?.type === "top-level" &&
+              sidebarDrag.target.index === topLevelIndex + 1;
+
             return (
               <li
-                key={s.id}
-                className={`session-item ${
-                  s.id === activeSessionId ? "active" : ""
+                key={folder.id}
+                className={`sidebar-folder ${isDragging ? "dragging" : ""} ${
+                  isDropInto ? "drop-into" : ""
+                } ${isDropBefore ? "drop-before" : ""} ${
+                  isDropAfter ? "drop-after" : ""
                 }`}
-                title={s.folder ?? ""}
-                onClick={() => setActiveSessionId(s.id)}
-                onDoubleClick={(e) => {
-                  e.stopPropagation();
-                  beginRename(s.id, s.name);
-                }}
               >
-                <span
-                  className={`session-dot ${s.folder ? "linked" : ""}`}
-                  title={s.folder ?? ""}
-                />
-                {isRenaming ? (
-                  <input
-                    ref={renameInputRef}
-                    className="session-rename-input"
-                    value={renameDraft}
-                    onChange={(e) => setRenameDraft(e.target.value)}
-                    onBlur={() => commitRename(s.id)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        commitRename(s.id);
-                      }
-                      if (e.key === "Escape") {
-                        e.preventDefault();
-                        cancelRename();
-                      }
-                    }}
-                    onClick={(e) => e.stopPropagation()}
-                    onDoubleClick={(e) => e.stopPropagation()}
-                  />
-                ) : (
-                  <span className="session-name">{s.name}</span>
-                )}
-                <span className="session-count">{aliveCount}</span>
-                <button
-                  className="close-btn"
-                  title="Close session"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    closeSession(s.id);
+                <div
+                  className="folder-item"
+                  data-sidebar-drop="folder"
+                  data-sidebar-top-index={topLevelIndex}
+                  data-sidebar-folder-id={folder.id}
+                  onPointerDown={(event) =>
+                    beginSidebarPointerDrag("folder", folder.id, event)
+                  }
+                  onClick={(event) => {
+                    if (sidebarSuppressClickRef.current) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      return;
+                    }
+                    toggleSidebarFolder(folder.id);
+                  }}
+                  onDoubleClick={(event) => {
+                    event.stopPropagation();
+                    beginFolderRename(folder.id, folder.name);
                   }}
                 >
-                  ×
-                </button>
+                  <span className={`folder-chevron ${folder.collapsed ? "collapsed" : ""}`}>
+                    ▾
+                  </span>
+                  <span className="folder-icon" aria-hidden="true" />
+                  {isRenaming ? (
+                    <input
+                      ref={renameInputRef}
+                      className="session-rename-input"
+                      value={renameDraft}
+                      onChange={(event) => setRenameDraft(event.target.value)}
+                      onBlur={() => commitFolderRename(folder.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          commitFolderRename(folder.id);
+                        }
+                        if (event.key === "Escape") {
+                          event.preventDefault();
+                          cancelRename();
+                        }
+                      }}
+                      onClick={(event) => event.stopPropagation()}
+                      onDoubleClick={(event) => event.stopPropagation()}
+                    />
+                  ) : (
+                    <span className="folder-name">{folder.name}</span>
+                  )}
+                  <span className="session-count">{paneCount}</span>
+                  <button
+                    className="folder-delete-btn"
+                    title="Delete folder"
+                    aria-label={`Delete folder ${folder.name}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      deleteSidebarFolder(folder.id);
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+                {!folder.collapsed && (
+                  <ul
+                    className="folder-session-list"
+                    data-sidebar-drop="folder-content"
+                    data-sidebar-top-index={topLevelIndex}
+                    data-sidebar-folder-id={folder.id}
+                    data-sidebar-folder-index={folderSessions.length}
+                  >
+                    {folderSessions.map((session, folderIndex) =>
+                      renderSessionRow(
+                        session,
+                        topLevelIndex,
+                        folder.id,
+                        folderIndex
+                      )
+                    )}
+                    {folderSessions.length === 0 && (
+                      <li
+                        className={`folder-empty-drop ${isDropInto ? "drop-into" : ""}`}
+                      >
+                        Drop sessions here
+                      </li>
+                    )}
+                  </ul>
+                )}
               </li>
             );
           })}
         </ul>
+        )}
+        <div
+          className="sidebar-resize-handle"
+          title="Drag to resize sidebar"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          onPointerDown={beginSidebarResize}
+        />
       </aside>
 
       <main className="terminal-pane">
@@ -2677,7 +3870,9 @@ function App() {
                           activeWinId={session.activeWinId}
                           dragState={isActive ? paneDrag : null}
                           blinkingPanes={isActive ? blinkingPanes : new Set()}
-                          onClose={closeWindow}
+                          onClose={(paneId) => {
+                            void closeWindow(paneId);
+                          }}
                           onFocus={setActiveWin}
                           onHeaderPointerDown={beginPaneDrag}
                           onResizeSplit={resizeSplit}
@@ -2686,6 +3881,8 @@ function App() {
                           onToggleDictation={togglePaneDictation}
                           onCancelDictation={cancelPaneDictation}
                           orchestrator={orchestrator}
+                          aiSettings={settings.ai}
+                          onOpenAiSettings={() => openSettings("ai")}
                           panesProvider={() =>
                             session.windows
                               .filter((w) => w.alive)
@@ -2729,6 +3926,68 @@ function App() {
           </div>
         )}
       </main>
+
+      {settingsOpen && <AppSettingsModal api={appSettings} />}
+
+      {confirmDialog &&
+        createPortal(
+          <div
+            className="confirm-modal-backdrop"
+            onMouseDown={(e) => {
+              // Only dismiss when pressing the backdrop itself (not the card).
+              if (e.target === e.currentTarget) resolveConfirm(false);
+            }}
+          >
+            <div
+              className="confirm-modal"
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="confirm-dialog-title"
+              aria-describedby="confirm-dialog-message"
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              <header className="confirm-modal-header">
+                <span className="confirm-modal-title" id="confirm-dialog-title">
+                  {confirmDialog.title}
+                </span>
+                <button
+                  type="button"
+                  className="confirm-modal-x"
+                  aria-label="Cancel"
+                  onClick={() => resolveConfirm(false)}
+                >
+                  ×
+                </button>
+              </header>
+              <div className="confirm-modal-body">
+                <span className="confirm-modal-icon" aria-hidden="true">
+                  ⚠
+                </span>
+                <p className="confirm-modal-message" id="confirm-dialog-message">
+                  {confirmDialog.message}
+                </p>
+              </div>
+              <footer className="confirm-modal-footer">
+                <button
+                  type="button"
+                  className="confirm-modal-btn"
+                  onClick={() => resolveConfirm(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="confirm-modal-btn confirm-modal-btn-danger"
+                  autoFocus
+                  onClick={() => resolveConfirm(true)}
+                >
+                  Close
+                </button>
+              </footer>
+            </div>
+          </div>,
+          document.body
+        )}
 
       {agentToasts.length > 0 && (
         <div

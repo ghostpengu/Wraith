@@ -193,6 +193,10 @@ fn agent_settings_path(home: &Path) -> PathBuf {
     home.join(".wraith").join("agent.json")
 }
 
+fn app_settings_path(home: &Path) -> PathBuf {
+    home.join(".wraith").join("settings.json")
+}
+
 fn default_agent_settings() -> Value {
     json!({
         "provider": "openrouter",
@@ -201,6 +205,82 @@ fn default_agent_settings() -> Value {
         "apiKey": "",
         "dictationStyle": "clean"
     })
+}
+
+fn default_app_settings() -> Value {
+    json!({
+        "version": 1,
+        "appearance": {
+            "theme": "vscode-dark"
+        },
+        "terminal": {
+            "fontFamily": "Cascadia Code, Consolas, Courier New, monospace",
+            "fontSize": 13,
+            "colorMode": "theme",
+            "colors": {
+                "foreground": "#cccccc",
+                "background": "#1e1e1e",
+                "cursor": "#ffffff",
+                "selectionBackground": "#264f78"
+            }
+        },
+        "ai": default_agent_settings(),
+        "general": {
+            "confirmClosePane": true,
+            "confirmCloseSession": true,
+            "sidebarCollapsed": false,
+            "sidebarWidth": 220,
+            "window": {
+                "width": 900,
+                "height": 700,
+                "x": null,
+                "y": null
+            }
+        }
+    })
+}
+
+/// Deep-merge `overlay` into `base` for objects; non-objects are replaced.
+fn merge_json(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (key, val) in overlay_map {
+                match base_map.get_mut(key) {
+                    Some(existing) => merge_json(existing, val),
+                    None => {
+                        base_map.insert(key.clone(), val.clone());
+                    }
+                }
+            }
+        }
+        (base_slot, overlay_val) => {
+            *base_slot = overlay_val.clone();
+        }
+    }
+}
+
+fn load_app_settings_value() -> Result<Value, String> {
+    let home = user_home()?;
+    let path = app_settings_path(&home);
+    let mut settings = default_app_settings();
+
+    if path.exists() {
+        let file = load_json_object(&path)?;
+        merge_json(&mut settings, &file);
+    } else {
+        // One-time migration: seed AI section from legacy agent.json.
+        let agent_path = agent_settings_path(&home);
+        if agent_path.exists() {
+            let agent = load_json_object(&agent_path)?;
+            if let Some(ai) = settings.get_mut("ai") {
+                merge_json(ai, &agent);
+            }
+            // Persist migrated settings so subsequent loads use settings.json.
+            let _ = write_json_pretty(&path, &settings);
+        }
+    }
+
+    Ok(settings)
 }
 
 fn write_json_pretty(path: &Path, value: &Value) -> Result<(), String> {
@@ -375,28 +455,47 @@ fn agent_hook_url(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn load_agent_settings() -> Result<Value, String> {
-    let home = user_home()?;
-    let path = agent_settings_path(&home);
-    if !path.exists() {
-        return Ok(default_agent_settings());
-    }
-    let value = load_json_object(&path)?;
-    // Merge with defaults so missing keys are filled in.
-    let mut defaults = default_agent_settings();
-    if let (Some(defaults_obj), Some(value_obj)) = (defaults.as_object_mut(), value.as_object()) {
-        for (key, val) in value_obj {
-            defaults_obj.insert(key.clone(), val.clone());
-        }
-    }
-    Ok(defaults)
+fn load_app_settings() -> Result<Value, String> {
+    load_app_settings_value()
 }
 
 #[tauri::command]
+fn save_app_settings(state: Value) -> Result<(), String> {
+    let home = user_home()?;
+    let path = app_settings_path(&home);
+    // Merge onto defaults so partial saves never drop unknown/missing keys.
+    let mut merged = default_app_settings();
+    merge_json(&mut merged, &state);
+    write_json_pretty(&path, &merged)
+}
+
+/// Compatibility: load AI section from unified settings.json.
+#[tauri::command]
+fn load_agent_settings() -> Result<Value, String> {
+    let settings = load_app_settings_value()?;
+    Ok(settings
+        .get("ai")
+        .cloned()
+        .unwrap_or_else(default_agent_settings))
+}
+
+/// Compatibility: write AI section into unified settings.json.
+#[tauri::command]
 fn save_agent_settings(state: Value) -> Result<(), String> {
     let home = user_home()?;
-    let path = agent_settings_path(&home);
-    write_json_pretty(&path, &state)
+    let path = app_settings_path(&home);
+    let mut settings = load_app_settings_value()?;
+    if let Some(ai) = settings.get_mut("ai") {
+        // Replace AI section keys with provided state (merged onto defaults).
+        let mut ai_defaults = default_agent_settings();
+        merge_json(&mut ai_defaults, &state);
+        *ai = ai_defaults;
+    } else if let Some(obj) = settings.as_object_mut() {
+        let mut ai_defaults = default_agent_settings();
+        merge_json(&mut ai_defaults, &state);
+        obj.insert("ai".to_string(), ai_defaults);
+    }
+    write_json_pretty(&path, &settings)
 }
 
 #[tauri::command]
@@ -680,6 +779,8 @@ pub fn run() {
             save_sessions,
             agent_hook_url,
             ensure_agent_hooks,
+            load_app_settings,
+            save_app_settings,
             load_agent_settings,
             save_agent_settings,
             agent_chat_completion,

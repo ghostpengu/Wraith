@@ -1,14 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import agentIcon from "../assets/ai-agent.svg";
+import type { AiSettings } from "../settings";
 import { AgentMarkdown } from "./AgentMarkdown";
 import {
   useAgent,
-  type AgentSettings,
   type AgentMessage,
 } from "./useAgent";
 import type { OrchestratorApi } from "./orchestratorTypes";
 import type { PaneInfo } from "./tools";
-import { AgentSettingsModal } from "./AgentSettingsModal";
 import {
   errorMessage,
   formatElapsed,
@@ -30,6 +29,8 @@ interface AgentPaneViewProps {
   folder: string | null;
   panes: () => PaneInfo[];
   orchestrator: OrchestratorApi;
+  aiSettings: AiSettings;
+  onOpenAiSettings: () => void;
 }
 
 function statusLabel(status: AgentMessage["status"]): string {
@@ -84,8 +85,15 @@ function MessageBubble({ message }: {
   );
 }
 
-export function AgentPaneView({ sessionName, folder, panes, orchestrator }: AgentPaneViewProps) {
-  const api = useAgent(folder, sessionName, orchestrator);
+export function AgentPaneView({
+  sessionName,
+  folder,
+  panes,
+  orchestrator,
+  aiSettings,
+  onOpenAiSettings,
+}: AgentPaneViewProps) {
+  const api = useAgent(folder, sessionName, orchestrator, aiSettings);
   const [draft, setDraft] = useState("");
   const [dictationStatus, setDictationStatus] = useState<DictationStatus>("idle");
   const [dictationError, setDictationError] = useState<string | null>(null);
@@ -148,17 +156,17 @@ export function AgentPaneView({ sessionName, folder, panes, orchestrator }: Agen
     });
   }, []);
 
-  const requireOpenRouterSettings = useCallback((): AgentSettings | null => {
+  const requireOpenRouterSettings = useCallback((): AiSettings | null => {
     const settings = api.settings;
     const validationError = validateDictationSettings(settings);
     if (validationError) {
       setDictationStatus("error");
       setDictationError(validationError);
-      api.openSettings();
+      onOpenAiSettings();
       return null;
     }
     return settings;
-  }, [api]);
+  }, [api, onOpenAiSettings]);
 
   const handleRecordedAudio = useCallback(
     async (blob: Blob) => {
@@ -421,8 +429,8 @@ export function AgentPaneView({ sessionName, folder, panes, orchestrator }: Agen
             <button
               type="button"
               className="agent-pane-pill"
-              onClick={api.openSettings}
-              title="Agent settings"
+              onClick={onOpenAiSettings}
+              title="AI settings"
             >
               <img src={agentIcon} alt="" className="agent-pane-pill-icon" />
               <span>{providerLabel}</span>
@@ -431,7 +439,7 @@ export function AgentPaneView({ sessionName, folder, panes, orchestrator }: Agen
             <button
               type="button"
               className="agent-pane-pill"
-              onClick={api.openSettings}
+              onClick={onOpenAiSettings}
               title={modelLabel}
             >
               <span>{modelLabel}</span>
@@ -487,13 +495,6 @@ export function AgentPaneView({ sessionName, folder, panes, orchestrator }: Agen
         </div>
       </form>
 
-      {api.settingsOpen && (
-        <AgentSettingsModal
-          settings={api.settings}
-          onClose={api.closeSettings}
-          onSave={api.saveSettings}
-        />
-      )}
     </div>
   );
 }
