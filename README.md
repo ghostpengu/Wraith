@@ -10,7 +10,7 @@ A tiling terminal emulator with a built-in AI agent pane. Built for Windows with
 [![Rust](https://img.shields.io/badge/Rust-backend-dea584?logo=rust)](https://www.rust-lang.org/)
 [![React 19](https://img.shields.io/badge/React-19-61dafb?logo=react)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-~5.8-3178c6?logo=typescript)](https://www.typescriptlang.org/)
-[![License](https://img.shields.io/badge/version-0.1.0-blue)](#)
+[![License](https://img.shields.io/badge/version-0.2.0-blue)](#)
 
 </div>
 
