@@ -31,6 +31,47 @@ struct PtyOutput {
     data: String,
 }
 
+// A PTY read can end in the middle of a UTF-8 character. Keep those bytes
+// until the next read so terminal output does not gain replacement glyphs.
+#[derive(Default)]
+struct Utf8OutputDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8OutputDecoder {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut output = String::new();
+
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    output.push_str(text);
+                    self.pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    output.push_str(std::str::from_utf8(&self.pending[..valid]).unwrap());
+                    self.pending.drain(..valid);
+                    if let Some(invalid_len) = error.error_len() {
+                        output.push('\u{fffd}');
+                        self.pending.drain(..invalid_len);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        output
+    }
+
+    fn finish(self) -> String {
+        String::from_utf8_lossy(&self.pending).into_owned()
+    }
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct AgentHookFinished {
@@ -211,17 +252,17 @@ fn default_app_settings() -> Value {
     json!({
         "version": 1,
         "appearance": {
-            "theme": "vscode-dark"
+            "theme": "wraith"
         },
         "terminal": {
             "fontFamily": "Cascadia Code, Consolas, Courier New, monospace",
             "fontSize": 13,
             "colorMode": "theme",
             "colors": {
-                "foreground": "#cccccc",
-                "background": "#1e1e1e",
-                "cursor": "#ffffff",
-                "selectionBackground": "#264f78"
+                "foreground": "#e1e9e9",
+                "background": "#0d1216",
+                "cursor": "#78d8bd",
+                "selectionBackground": "#285348"
             }
         },
         "ai": default_agent_settings(),
@@ -623,6 +664,7 @@ fn spawn_powershell(
     thread::spawn(move || {
         let mut reader = reader;
         let mut buf = [0u8; 4096];
+        let mut decoder = Utf8OutputDecoder::default();
         loop {
             if kill_flag_reader.load(Ordering::SeqCst) {
                 break;
@@ -630,7 +672,10 @@ fn spawn_powershell(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let data = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let data = decoder.push(&buf[..n]);
+                    if data.is_empty() {
+                        continue;
+                    }
                     let payload = PtyOutput {
                         id: id_for_thread.clone(),
                         data,
@@ -641,6 +686,16 @@ fn spawn_powershell(
                 }
                 Err(_) => break,
             }
+        }
+        let remaining = decoder.finish();
+        if !remaining.is_empty() {
+            let _ = app_handle.emit(
+                "pty-output",
+                PtyOutput {
+                    id: id_for_thread.clone(),
+                    data: remaining,
+                },
+            );
         }
         let _ = app_handle.emit("pty-exit", id_for_thread);
     });
@@ -795,4 +850,26 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Utf8OutputDecoder;
+
+    #[test]
+    fn pty_text_preserves_characters_split_across_reads() {
+        let mut decoder = Utf8OutputDecoder::default();
+        assert_eq!(decoder.push(b"A\xf0\x9f"), "A");
+        assert_eq!(decoder.push(b"\x91"), "");
+        assert_eq!(decoder.push(b"\x8b B"), "👋 B");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    #[test]
+    fn pty_text_replaces_only_invalid_bytes() {
+        let mut decoder = Utf8OutputDecoder::default();
+        assert_eq!(decoder.push(b"ok\xff!\xe2"), "ok�!");
+        assert_eq!(decoder.push(b"\x82\xac"), "€");
+        assert_eq!(decoder.finish(), "");
+    }
 }

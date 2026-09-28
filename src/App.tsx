@@ -8,6 +8,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import "@xterm/xterm/css/xterm.css";
+import { shouldWaitForCursorCorrection } from "./terminalOutput";
 import openaiIcon from "./assets/ai-openai.svg";
 import claudeIcon from "./assets/ai-claude.svg";
 import opencodeIcon from "./assets/ai-opencode.svg";
@@ -773,17 +774,88 @@ function layoutSignature(node: LayoutNode | null): string {
 
 const scheduledFitFrames = new Map<string, number>();
 const syncedPtySize = new Map<string, { cols: number; rows: number }>();
+const requestedPtySize = new Map<string, { cols: number; rows: number }>();
+const resizingPtyIds = new Set<string>();
+const terminalOutputBatches = new Map<string, {
+  win: Win;
+  data: string;
+  timer: number | null;
+}>();
+
+function discardTerminalOutput(ptyId: string) {
+  const batch = terminalOutputBatches.get(ptyId);
+  if (!batch) return;
+  if (batch.timer !== null) window.clearTimeout(batch.timer);
+  terminalOutputBatches.delete(ptyId);
+}
+
+function flushTerminalOutput(ptyId: string) {
+  const batch = terminalOutputBatches.get(ptyId);
+  if (!batch) return;
+  discardTerminalOutput(ptyId);
+  batch.win.term.write(batch.data);
+}
+
+function queueTerminalOutput(win: Win, data: string) {
+  if (!data) return;
+  if (win.term.options.cursorBlink) win.term.options.cursorBlink = false;
+  let batch = terminalOutputBatches.get(win.id);
+  if (!batch) {
+    batch = { win, data: "", timer: null };
+    terminalOutputBatches.set(win.id, batch);
+  }
+  batch.data += data;
+
+  // Keep ordinary output immediate. Only delay the frame in which a TUI has
+  // shown its cursor before moving it back to the input row.
+  if (batch.data.length < 128 * 1024 && shouldWaitForCursorCorrection(batch.data)) {
+    if (batch.timer === null) {
+      batch.timer = window.setTimeout(() => flushTerminalOutput(win.id), 60);
+    }
+    return;
+  }
+
+  flushTerminalOutput(win.id);
+}
 
 function clearSyncedPtySize(ptyId: string) {
   syncedPtySize.delete(ptyId);
+  requestedPtySize.delete(ptyId);
 }
 
 function syncPtySizeForId(ptyId: string, cols: number, rows: number) {
   if (cols <= 0 || rows <= 0) return;
-  const prev = syncedPtySize.get(ptyId);
-  if (prev?.cols === cols && prev?.rows === rows) return;
-  syncedPtySize.set(ptyId, { cols, rows });
-  void invoke("resize_powershell", { id: ptyId, cols, rows });
+  requestedPtySize.set(ptyId, { cols, rows });
+  if (resizingPtyIds.has(ptyId)) return;
+
+  resizingPtyIds.add(ptyId);
+  void (async () => {
+    try {
+      while (true) {
+        const requested = requestedPtySize.get(ptyId);
+        const synced = syncedPtySize.get(ptyId);
+        if (!requested || (synced?.cols === requested.cols && synced?.rows === requested.rows)) {
+          break;
+        }
+        try {
+          await invoke("resize_powershell", {
+            id: ptyId,
+            cols: requested.cols,
+            rows: requested.rows,
+          });
+        } catch {
+          // Keep the newest size when a resize during a drag supersedes this one.
+          if (requestedPtySize.get(ptyId) !== requested) continue;
+          // A later fit can retry after a transient PTY resize failure.
+          break;
+        }
+        if (!requestedPtySize.has(ptyId)) break;
+        syncedPtySize.set(ptyId, requested);
+      }
+    } finally {
+      resizingPtyIds.delete(ptyId);
+    }
+  })();
 }
 
 function syncPtySize(win: Win) {
@@ -792,6 +864,13 @@ function syncPtySize(win: Win) {
 
 function fitAndRefresh(win: Win) {
   try {
+    const container = win.term.element?.parentElement;
+    if (!container?.isConnected) return;
+    const sessionView = container.closest(".session-view");
+    if (sessionView && !sessionView.classList.contains("active")) return;
+    if (container.clientWidth < 20 || container.clientHeight < 20) return;
+    const dimensions = win.fitAddon.proposeDimensions();
+    if (!dimensions || dimensions.cols < 2 || dimensions.rows < 1) return;
     win.fitAddon.fit();
     syncPtySize(win);
     const rows = win.term.rows;
@@ -911,6 +990,7 @@ function TermContainer({ win }: { win: Win }) {
     } else {
       win.term.open(container);
     }
+    container.style.backgroundColor = win.term.options.theme?.background ?? "";
 
     let frameId = 0;
     let passes = 0;
@@ -927,7 +1007,10 @@ function TermContainer({ win }: { win: Win }) {
     };
     frameId = window.requestAnimationFrame(settleFit);
 
-    return () => window.cancelAnimationFrame(frameId);
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      cancelScheduledFit(win.paneId);
+    };
   }, [win]);
 
   useEffect(() => {
@@ -935,7 +1018,10 @@ function TermContainer({ win }: { win: Win }) {
     if (!container) return;
     const ro = new ResizeObserver(() => scheduleFitAndRefresh(win));
     ro.observe(container);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      cancelScheduledFit(win.paneId);
+    };
   }, [win]);
 
   return <div className="term-container" ref={containerRef} />;
@@ -1497,7 +1583,12 @@ function App() {
       colors: s.terminal.colors,
     };
     for (const w of collectAliveWindows()) {
+      w.term.options.cursorBlink = false;
       applyTerminalAppearance(w, opts, (win) => fitAndRefresh(win as Win));
+      const container = w.term.element?.parentElement;
+      if (container?.classList.contains("term-container")) {
+        (container as HTMLElement).style.backgroundColor = w.term.options.theme?.background ?? "";
+      }
     }
   }, [collectAliveWindows, settingsRef]);
 
@@ -1924,6 +2015,7 @@ function App() {
 
   const clearPtyTransientState = useCallback(
     (ptyId: string) => {
+      discardTerminalOutput(ptyId);
       pendingOutputRef.current.delete(ptyId);
       pendingExitRef.current.delete(ptyId);
       clearAgentTracking(ptyId);
@@ -1997,7 +2089,7 @@ function App() {
 
         const win = findWindow(e.payload.id);
         if (win && win.alive) {
-          win.term.write(data);
+          queueTerminalOutput(win, data);
           return;
         }
 
@@ -2042,7 +2134,9 @@ function App() {
       const term = new Terminal({
         fontFamily,
         fontSize: s.terminal.fontSize,
-        cursorBlink: true,
+        // TUI apps redraw their own cursor; xterm's blink timer makes it flash
+        // during those redraws, so keep the terminal cursor steady.
+        cursorBlink: false,
         scrollback: 10000,
         windowsPty: { backend: "conpty" },
         theme: resolveTerminalTheme(
@@ -2131,6 +2225,7 @@ function App() {
   const handlePtyExit = useCallback(
     (ptyId: string) => {
       if (closingRef.current) return;
+      flushTerminalOutput(ptyId);
       clearAgentTracking(ptyId);
       if (intentionalKillRef.current.has(ptyId)) {
         intentionalKillRef.current.delete(ptyId);
@@ -3289,7 +3384,7 @@ function App() {
       for (const w of s.windows) {
         const pending = pendingOutputRef.current.get(w.id);
         if (pending) {
-          w.term.write(pending);
+          queueTerminalOutput(w, pending);
           pendingOutputRef.current.delete(w.id);
           scheduleFitAndRefresh(w);
         }
@@ -3550,7 +3645,12 @@ function App() {
             >
               <img src={appLogo} alt="" className="brand-logo" />
             </button>
-            {!sidebarCollapsed && <span className="brand-title">Wraith</span>}
+            {!sidebarCollapsed && (
+              <span className="brand-copy">
+                <span className="brand-title">Wraith</span>
+                <span className="brand-subtitle">TERMINAL WORKSPACE</span>
+              </span>
+            )}
           </div>
           {!sidebarCollapsed && (
             <div className="sidebar-actions" ref={headerMenuRef}>
@@ -3606,7 +3706,7 @@ function App() {
                     }}
                   >
                     <span className="sidebar-menu-icon" aria-hidden="true">
-                      📁
+                      <span className="header-folder-icon" />
                     </span>
                     <span>New linked session</span>
                   </button>
@@ -3629,6 +3729,12 @@ function App() {
             </div>
           )}
         </header>
+        {!sidebarCollapsed && (
+          <div className="sidebar-section-heading">
+            <span>SESSIONS</span>
+            <span>{sessions.length}</span>
+          </div>
+        )}
         {sidebarCollapsed ? (
           <div className="sidebar-collapsed-rail">
             <button
@@ -3846,6 +3952,7 @@ function App() {
                 <button
                   className="tool-btn font-btn reset"
                   title="Reset size (Ctrl + 0)"
+                  aria-label="Reset terminal font size"
                   onClick={resetFontSize}
                 >
                   Reset

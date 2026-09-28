@@ -1,4 +1,5 @@
 export type ThemeId =
+  | "wraith"
   | "vscode-dark"
   | "midnight"
   | "one-dark"
@@ -47,10 +48,10 @@ export interface TerminalSettings {
 }
 
 export const DEFAULT_TERMINAL_COLORS: TerminalColors = {
-  foreground: "#cccccc",
-  background: "#1e1e1e",
-  cursor: "#ffffff",
-  selectionBackground: "#264f78",
+  foreground: "#e1e9e9",
+  background: "#0d1216",
+  cursor: "#78d8bd",
+  selectionBackground: "#285348",
 };
 
 export interface WindowGeometry {
@@ -121,7 +122,7 @@ export const AI_PROVIDER_PRESETS: Record<
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   version: 1,
   appearance: {
-    theme: "vscode-dark",
+    theme: "wraith",
   },
   terminal: {
     fontFamily: DEFAULT_FONT_FAMILY,
@@ -151,6 +152,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
 };
 
 const THEME_IDS: ThemeId[] = [
+  "wraith",
   "vscode-dark",
   "midnight",
   "one-dark",

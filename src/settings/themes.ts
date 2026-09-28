@@ -62,6 +62,33 @@ function theme(
 }
 
 export const THEME_PRESETS: Record<ThemeId, ThemePreset> = {
+  wraith: theme(
+    "wraith",
+    "Wraith",
+    "Quiet charcoal with a soft mint accent.",
+    {
+      "--bg": "#0d1216",
+      "--sidebar-bg": "#12191e",
+      "--sidebar-border": "#263239",
+      "--accent": "#187f70",
+      "--accent-hover": "#229984",
+      "--text": "#e1e9e9",
+      "--text-dim": "#91a1a5",
+      "--danger": "#df777c",
+      "--toolbar-bg": "#11181d",
+      "--pane-header-bg": "#151d22",
+      "--tile-border": "#29373e",
+      "--tile-border-active": "#58aa97",
+      "--tile-border-target": "#a2c8b3",
+      "--divider": "rgba(225, 233, 233, 0.08)",
+    },
+    {
+      background: "#0d1216",
+      foreground: "#e1e9e9",
+      cursor: "#78d8bd",
+      selectionBackground: "#285348",
+    }
+  ),
   "vscode-dark": theme(
     "vscode-dark",
     "VS Code Dark",
@@ -602,5 +629,5 @@ export const THEME_PRESETS: Record<ThemeId, ThemePreset> = {
 export const THEME_LIST: ThemePreset[] = Object.values(THEME_PRESETS);
 
 export function getTheme(id: ThemeId): ThemePreset {
-  return THEME_PRESETS[id] ?? THEME_PRESETS["vscode-dark"];
+  return THEME_PRESETS[id] ?? THEME_PRESETS.wraith;
 }
