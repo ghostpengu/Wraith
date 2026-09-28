@@ -990,7 +990,10 @@ function TermContainer({ win }: { win: Win }) {
     } else {
       win.term.open(container);
     }
-    container.style.backgroundColor = win.term.options.theme?.background ?? "";
+    container.style.setProperty(
+      "--terminal-background",
+      win.term.options.theme?.background ?? "var(--bg)"
+    );
 
     let frameId = 0;
     let passes = 0;
@@ -1587,7 +1590,10 @@ function App() {
       applyTerminalAppearance(w, opts, (win) => fitAndRefresh(win as Win));
       const container = w.term.element?.parentElement;
       if (container?.classList.contains("term-container")) {
-        (container as HTMLElement).style.backgroundColor = w.term.options.theme?.background ?? "";
+        container.style.setProperty(
+          "--terminal-background",
+          w.term.options.theme?.background ?? "var(--bg)"
+        );
       }
     }
   }, [collectAliveWindows, settingsRef]);
