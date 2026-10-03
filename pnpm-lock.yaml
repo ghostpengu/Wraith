@@ -17,6 +17,9 @@ dependencies:
   '@xterm/addon-fit':
     specifier: ^0.11.0
     version: 0.11.0
+  '@xterm/addon-webgl':
+    specifier: ^0.19.0
+    version: 0.19.0
   '@xterm/xterm':
     specifier: ^6.0.0
     version: 6.0.0
@@ -892,6 +895,10 @@ packages:
 
   /@xterm/addon-fit@0.11.0:
     resolution: {integrity: sha512-jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g==}
+    dev: false
+
+  /@xterm/addon-webgl@0.19.0:
+    resolution: {integrity: sha512-b3fMOsyLVuCeNJWxolACEUED0vm7qC0cy4wRvf3oURSzDTYVQiGPhTnhWZwIHdvC48Y+oLhvYXnY4XDXPoJo6A==}
     dev: false
 
   /@xterm/xterm@6.0.0:

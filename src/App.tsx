@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -897,6 +898,35 @@ function cancelScheduledFit(paneId: string) {
   if (frame !== undefined) {
     window.cancelAnimationFrame(frame);
     scheduledFitFrames.delete(paneId);
+  }
+}
+
+const webglRenderers = new WeakMap<Terminal, WebglAddon>();
+
+// The DOM renderer draws block and box characters with the font, so they spill
+// out of their cells (broken TUI logos, gaps in borders). WebGL draws them on
+// the cell grid. WebView2 keeps only ~16 WebGL contexts alive, so only the
+// visible session's terminals get one; hidden ones stay on the DOM renderer.
+function setWebglRenderer(term: Terminal, enabled: boolean) {
+  const current = webglRenderers.get(term);
+  if (enabled === (current !== undefined)) return;
+  if (current) {
+    webglRenderers.delete(term);
+    current.dispose();
+    return;
+  }
+  if (!term.element) return;
+  try {
+    const webgl = new WebglAddon();
+    webgl.onContextLoss(() => {
+      // xterm falls back to the DOM renderer; the next session switch retries.
+      if (webglRenderers.get(term) === webgl) webglRenderers.delete(term);
+      webgl.dispose();
+    });
+    term.loadAddon(webgl);
+    webglRenderers.set(term, webgl);
+  } catch {
+    // WebGL unavailable; keep the DOM renderer.
   }
 }
 
@@ -2143,6 +2173,8 @@ function App() {
         // TUI apps redraw their own cursor; xterm's blink timer makes it flash
         // during those redraws, so keep the terminal cursor steady.
         cursorBlink: false,
+        cursorStyle: "underline",
+        cursorInactiveStyle: "underline",
         scrollback: 10000,
         windowsPty: { backend: "conpty" },
         theme: resolveTerminalTheme(
@@ -3402,6 +3434,15 @@ function App() {
       }
     }
   }, [sessions]);
+
+  // Runs after TermContainer effects, so new terminals are already open.
+  useEffect(() => {
+    for (const s of sessions) {
+      for (const w of s.windows) {
+        setWebglRenderer(w.term, s.id === activeSessionId);
+      }
+    }
+  }, [sessions, activeSessionId]);
 
   useEffect(() => {
     return () => {
