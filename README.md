@@ -51,6 +51,7 @@ Wraith is a Windows desktop terminal that runs PowerShell inside real pseudo-ter
 - Linked sessions, pane restart, persistence
 - AI shortcuts for `codex`, `opencode`, `claude`, `grok` directly in the toolbar
 - Agent completion notifications — blinking pane, confetti, chime
+- "Waiting for input" notifications for interactive agents launched from the toolbar: after you submit a prompt, the pane is considered idle when its output goes quiet for 10 s, or for 2 s if the last line looks like a prompt (`?`, `(y/n)`, `>`, `❯`, "press enter"). Fires once per prompt and is skipped while the window is focused on that pane
 - Dictation support (voice → text) in the agent pane
 - Confirm-before-close dialogs for panes and sessions (toggle in **Settings → General**)
 - Window size/position persistence across restarts

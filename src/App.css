@@ -1322,6 +1322,10 @@ body,
   border-left-color: #c7a64a;
 }
 
+.agent-toast.waiting {
+  border-left-color: #569cd6;
+}
+
 .agent-toast-main {
   min-width: 0;
   flex: 1 1 auto;
