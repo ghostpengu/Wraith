@@ -170,6 +170,16 @@ New panes split relative to the active pane; direction follows aspect ratio. Hel
 - **Session** — named tab containing multiple `Win` objects and one layout tree
 - **Win** — xterm `Terminal` + `FitAddon`, tied to a PTY `id`
 - Sessions stay mounted but hidden (`session-view` / `aria-hidden`) so xterm state survives tab switches
+- Sessions, their pane layout and each pane's working directory are saved to `sessions.json` and restored on launch. The per-pane directory is picked up from OSC 7 (`file://host/path`) or OSC 9;9 sequences emitted by the shell. Stock PowerShell doesn't emit these; add this to your `$PROFILE` to enable it (otherwise panes reopen in the session folder):
+
+  ```powershell
+  $__wraithPrompt = $function:prompt
+  function prompt {
+    $loc = $executionContext.SessionState.Path.CurrentLocation
+    if ($loc.Provider.Name -eq "FileSystem") { Write-Host -NoNewline "$([char]27)]9;9;`"$($loc.ProviderPath)`"$([char]27)\" }
+    & $__wraithPrompt
+  }
+  ```
 
 ### Agent tool loop
 

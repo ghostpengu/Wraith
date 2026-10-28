@@ -151,6 +151,11 @@ interface Win {
   onResizeDispose: () => void;
   onDataDispose: () => void;
   alive: boolean;
+  /**
+   * Last working directory reported by the shell (OSC 7 / OSC 9;9).
+   * Boxed so it survives the `{ ...win }` copies made on pane restart.
+   */
+  cwd: { current: string | null };
 }
 
 interface Session {
@@ -168,6 +173,8 @@ interface PersistedSession {
   folder: string | null;
   activePaneId: string | null;
   layout: LayoutNode | null;
+  /** Per-pane working directory, restored on next launch. */
+  paneCwds?: Record<string, string>;
 }
 
 interface SidebarFolder {
@@ -470,17 +477,45 @@ function toPersistedState(
         }
       }
       if (!activePaneId) activePaneId = firstTerminalLeafId(layout);
+      const paneCwds: Record<string, string> = {};
+      for (const win of s.windows) {
+        if (win.cwd.current) paneCwds[win.paneId] = win.cwd.current;
+      }
       return {
         id: s.id,
         name: s.name,
         folder: s.folder,
         activePaneId,
         layout,
+        paneCwds,
       };
     }),
     folders: normalizedSidebar.folders,
     sidebarItems: normalizedSidebar.items,
   };
+}
+
+/**
+ * Parse a working directory from OSC 7 (`file://host/path`) or
+ * OSC 9;9 (`9;"C:\\path"`, Windows Terminal / ConEmu convention).
+ */
+function parseCwdOsc(ident: 7 | 9, data: string): string | null {
+  if (ident === 9) {
+    if (!data.startsWith("9;")) return null;
+    const value = data.slice(2).trim().replace(/^"(.*)"$/, "$1");
+    return value || null;
+  }
+  const match = /^file:\/\/[^/]*(\/.*)$/.exec(data);
+  if (!match) return null;
+  let path: string;
+  try {
+    path = decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+  // file:///C:/Users -> C:/Users on Windows.
+  if (/^\/[A-Za-z]:/.test(path)) path = path.slice(1);
+  return path || null;
 }
 
 function isLayoutNode(value: unknown): value is LayoutNode {
@@ -534,12 +569,24 @@ function validatePersistedState(data: unknown): PersistedState | null {
       return null;
     }
 
+    const paneCwds: Record<string, string> = {};
+    if (session.paneCwds && typeof session.paneCwds === "object") {
+      for (const [paneId, cwd] of Object.entries(
+        session.paneCwds as Record<string, unknown>
+      )) {
+        if (unique.has(paneId) && typeof cwd === "string" && cwd) {
+          paneCwds[paneId] = cwd;
+        }
+      }
+    }
+
     sessions.push({
       id: session.id,
       name: session.name,
       folder: session.folder as string | null,
       activePaneId: session.activePaneId as string | null,
       layout: session.layout as LayoutNode | null,
+      paneCwds,
     });
   }
 
@@ -2188,7 +2235,7 @@ function App() {
       term.loadAddon(fitAddon);
       const listeners = attachPtyListeners(id, term, handleTerminalInput);
 
-      return {
+      const win: Win = {
         paneId: paneId ?? createPaneId(),
         id,
         term,
@@ -2196,7 +2243,17 @@ function App() {
         onResizeDispose: listeners.onResizeDispose,
         onDataDispose: listeners.onDataDispose,
         alive: true,
+        cwd: { current: cwd ?? null },
       };
+      for (const ident of [7, 9] as const) {
+        term.parser.registerOscHandler(ident, (data) => {
+          const next = parseCwdOsc(ident, data);
+          if (!next) return false;
+          win.cwd.current = next;
+          return true;
+        });
+      }
+      return win;
     },
     [handleTerminalInput, settingsRef]
   );
@@ -2217,7 +2274,7 @@ function App() {
       sessionId = s.id;
       winIndex = index;
       oldWin = s.windows[index];
-      cwd = s.folder;
+      cwd = oldWin.cwd.current ?? s.folder;
       break;
     }
 
@@ -2332,9 +2389,16 @@ function App() {
           const paneIds = collectPaneIds(persistedSession.layout);
           const windows: Win[] = [];
           for (const paneId of paneIds) {
-            windows.push(
-              await createWin(persistedSession.folder, paneId)
-            );
+            const paneCwd = persistedSession.paneCwds?.[paneId];
+            let win: Win;
+            try {
+              win = await createWin(paneCwd ?? persistedSession.folder, paneId);
+            } catch (err) {
+              // Saved directory may no longer exist; fall back to the session folder.
+              if (!paneCwd) throw err;
+              win = await createWin(persistedSession.folder, paneId);
+            }
+            windows.push(win);
           }
 
           restored.push({
