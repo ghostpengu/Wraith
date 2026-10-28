@@ -62,6 +62,7 @@ const AI_SHORTCUTS: AiShortcut[] = [
   { label: "opencode", command: "opencode", icon: opencodeIcon },
   { label: "claude", command: "claude", icon: claudeIcon },
   { label: "grok", command: "grok", badge: "G" },
+  { label: "antigravity", command: "agy", badge: "A" },
 ];
 
 interface PtyOutputPayload {
