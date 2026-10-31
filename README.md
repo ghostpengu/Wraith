@@ -28,6 +28,7 @@ Wraith is a Windows desktop terminal that runs PowerShell inside real pseudo-ter
 - Custom terminal colors (foreground / background / cursor / selection) override the theme
 - Font picker with preset catalog (incl. Google Font loading), size 8–32, `FitAddon`-driven resizing
 - Font zoom, `Cascadia Code` terminal stack by default
+- `Ctrl+F` search in the focused terminal's scrollback (`@xterm/addon-search`; Enter / Shift+Enter, Esc to close)
 
 ### Sidebar
 - Collapsible, resizable sidebar (drag the handle; snaps closed below a threshold)

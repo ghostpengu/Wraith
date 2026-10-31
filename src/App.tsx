@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
@@ -152,6 +153,7 @@ interface Win {
   id: string;
   term: Terminal;
   fitAddon: FitAddon;
+  searchAddon: SearchAddon;
   onResizeDispose: () => void;
   onDataDispose: () => void;
   alive: boolean;
@@ -1218,6 +1220,124 @@ function DictationBubble({ state, onCancel }: {
   );
 }
 
+function SearchableTerm({ win }: { win: Win }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [caseSensitive, setCaseSensitive] = useState(false);
+  const [notFound, setNotFound] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  const find = (direction: "next" | "previous", text = query) => {
+    if (!text) {
+      setNotFound(false);
+      win.searchAddon.clearDecorations();
+      win.term.clearSelection();
+      return;
+    }
+    const options = { caseSensitive, incremental: direction === "next" };
+    const found =
+      direction === "next"
+        ? win.searchAddon.findNext(text, options)
+        : win.searchAddon.findPrevious(text, options);
+    setNotFound(!found);
+  };
+
+  const close = () => {
+    setOpen(false);
+    setNotFound(false);
+    win.searchAddon.clearDecorations();
+    win.term.clearSelection();
+    win.term.focus();
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, [open]);
+
+  return (
+    <div
+      className="term-search-host"
+      onKeyDownCapture={(e) => {
+        if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") {
+          e.preventDefault();
+          e.stopPropagation();
+          if (open) {
+            inputRef.current?.focus();
+            inputRef.current?.select();
+          } else {
+            setOpen(true);
+          }
+        }
+      }}
+    >
+      <TermContainer win={win} />
+      {open && (
+        <div
+          className="term-search-bar"
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <input
+            ref={inputRef}
+            className={`term-search-input ${notFound ? "not-found" : ""}`}
+            value={query}
+            placeholder="Find"
+            aria-label="Find in terminal"
+            spellCheck={false}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              find("next", e.target.value);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                find(e.shiftKey ? "previous" : "next");
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                close();
+              }
+            }}
+          />
+          <button
+            type="button"
+            className={`term-search-btn ${caseSensitive ? "active" : ""}`}
+            title="Match case"
+            aria-pressed={caseSensitive}
+            onClick={() => setCaseSensitive((v) => !v)}
+          >
+            Aa
+          </button>
+          <button
+            type="button"
+            className="term-search-btn"
+            title="Previous match (Shift+Enter)"
+            onClick={() => find("previous")}
+          >
+            ↑
+          </button>
+          <button
+            type="button"
+            className="term-search-btn"
+            title="Next match (Enter)"
+            onClick={() => find("next")}
+          >
+            ↓
+          </button>
+          <button
+            type="button"
+            className="term-search-btn"
+            title="Close (Esc)"
+            onClick={close}
+          >
+            ×
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TiledNode({
   node,
   session,
@@ -1371,7 +1491,7 @@ function TiledNode({
           </button>
         </div>
         <div className="pane-term">
-          <TermContainer win={win} />
+          <SearchableTerm win={win} />
         </div>
         {paneDictation && (
           <DictationBubble state={paneDictation} onCancel={onCancelDictation} />
@@ -2315,6 +2435,8 @@ function App() {
       });
       const fitAddon = new FitAddon();
       term.loadAddon(fitAddon);
+      const searchAddon = new SearchAddon();
+      term.loadAddon(searchAddon);
       const listeners = attachPtyListeners(id, term, handleTerminalInput);
 
       const win: Win = {
@@ -2322,6 +2444,7 @@ function App() {
         id,
         term,
         fitAddon,
+        searchAddon,
         onResizeDispose: listeners.onResizeDispose,
         onDataDispose: listeners.onDataDispose,
         alive: true,

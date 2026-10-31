@@ -2548,3 +2548,55 @@ body,
 .term-container .xterm {
   padding: 2px;
 }
+
+.term-search-host {
+  position: absolute;
+  inset: 0;
+}
+
+.term-search-bar {
+  position: absolute;
+  top: 6px;
+  right: 12px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--sidebar-bg);
+  box-shadow: 0 6px 18px var(--shadow);
+}
+
+.term-search-input {
+  width: 180px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+
+.term-search-input.not-found {
+  border-color: #c75a5a;
+}
+
+.term-search-btn {
+  min-width: 24px;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.term-search-btn:hover,
+.term-search-btn.active {
+  border-color: var(--border);
+  color: var(--text-strong);
+}
