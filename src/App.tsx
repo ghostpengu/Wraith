@@ -86,6 +86,10 @@ interface AgentRun {
   echoDisplayed: boolean;
   armed: boolean;
   notified: boolean;
+  /** Set once the idle heuristic fired; cleared when the user presses Enter. */
+  waitingNotified: boolean;
+  /** Last few hundred chars of visible output, used for prompt detection. */
+  outputTail: string;
 }
 
 interface AgentToast {
@@ -93,7 +97,7 @@ interface AgentToast {
   label: string;
   sessionName: string;
   exitCode: number;
-  status: "success" | "warning";
+  status: "success" | "warning" | "waiting";
 }
 
 type SplitDir = "row" | "column";
@@ -232,6 +236,18 @@ const saveDebounceMs = 500;
 const WINDOW_GEOMETRY_DEBOUNCE_MS = 400;
 const AGENT_TOAST_MS = 5000;
 const AGENT_BLINK_MS = 3000;
+/**
+ * "Waiting for input" heuristic for interactive agents (claude, codex, …)
+ * that never exit: after the user submits a prompt, if the pane produces
+ * output and then goes quiet, notify. A trailing prompt-like line shortens
+ * the delay; otherwise plain silence for AGENT_IDLE_MS counts as idle.
+ */
+const AGENT_IDLE_MS = 10000;
+const AGENT_PROMPT_IDLE_MS = 2000;
+const AGENT_OUTPUT_TAIL_CHARS = 400;
+const AGENT_PROMPT_RE =
+  /(\?|\(y\/n\)|\[y\/n\]|yes\/no|press enter[^\n]*|❯|>)\s*$/i;
+const ANSI_RE = /\x1b\[[0-9;?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[@-_]/g;
 const CONFETTI_PIECES = 28;
 const DICTATION_BAR_COUNT = 18;
 const DICTATION_IDLE_LEVEL = 0.18;
@@ -1494,6 +1510,9 @@ function App() {
   const blinkTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map()
   );
+  const idleTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map()
+  );
   const paneDictationRecorderRef = useRef<MediaRecorder | null>(null);
   const paneDictationStreamRef = useRef<MediaStream | null>(null);
   const paneDictationChunksRef = useRef<Blob[]>([]);
@@ -2062,10 +2081,69 @@ function App() {
     [showAgentToast, startBlinkingPane]
   );
 
+  const notifyAgentWaiting = useCallback(
+    (run: AgentRun) => {
+      const activeSession = sessionsRef.current.find(
+        (session) => session.id === activeSessionRef.current
+      );
+      // Skip when the user is already looking at this pane.
+      if (document.hasFocus() && activeSession?.activeWinId === run.paneId) {
+        return;
+      }
+      showAgentToast({
+        id: `${run.token}-waiting-${Date.now()}`,
+        label: run.label,
+        sessionName: run.sessionName,
+        exitCode: 0,
+        status: "waiting",
+      });
+      playAgentCompletionSound(false);
+      startBlinkingPane(run.paneId);
+      void getCurrentWindow()
+        .requestUserAttention(UserAttentionType.Informational)
+        .catch(() => undefined);
+    },
+    [showAgentToast, startBlinkingPane]
+  );
+
+  const clearIdleTimer = useCallback((ptyId: string) => {
+    const timer = idleTimersRef.current.get(ptyId);
+    if (timer) clearTimeout(timer);
+    idleTimersRef.current.delete(ptyId);
+  }, []);
+
+  const scheduleIdleCheck = useCallback(
+    (ptyId: string, run: AgentRun, visible: string) => {
+      if (!run.armed || run.notified || run.waitingNotified) return;
+      run.outputTail = (run.outputTail + visible.replace(ANSI_RE, "")).slice(
+        -AGENT_OUTPUT_TAIL_CHARS
+      );
+      const lastLine = run.outputTail.split(/\r?\n/).filter((l) => l.trim()).pop() ?? "";
+      const delay = AGENT_PROMPT_RE.test(lastLine)
+        ? AGENT_PROMPT_IDLE_MS
+        : AGENT_IDLE_MS;
+      clearIdleTimer(ptyId);
+      idleTimersRef.current.set(
+        ptyId,
+        setTimeout(() => {
+          idleTimersRef.current.delete(ptyId);
+          const current = agentRunsRef.current.get(ptyId);
+          if (current !== run || !run.armed || run.notified || run.waitingNotified) {
+            return;
+          }
+          run.waitingNotified = true;
+          notifyAgentWaiting(run);
+        }, delay)
+      );
+    },
+    [clearIdleTimer, notifyAgentWaiting]
+  );
+
   const clearAgentTracking = useCallback((ptyId: string) => {
+    clearIdleTimer(ptyId);
     agentRunsRef.current.delete(ptyId);
     markerTailRef.current.delete(ptyId);
-  }, []);
+  }, [clearIdleTimer]);
 
   const completeAgentRun = useCallback(
     (ptyId: string, exitCode: number, removeRun = false) => {
@@ -2116,8 +2194,11 @@ function App() {
 
       run.armed = true;
       run.notified = false;
+      run.waitingNotified = false;
+      run.outputTail = "";
+      clearIdleTimer(ptyId);
     },
-    []
+    [clearIdleTimer]
   );
 
   const processPtyData = useCallback(
@@ -2131,6 +2212,7 @@ function App() {
       const run = agentRunsRef.current.get(ptyId);
       if (run) {
         visible = processAgentRunOutput(run, visible);
+        if (visible) scheduleIdleCheck(ptyId, run, visible);
       }
 
       for (const marker of parsed.markers) {
@@ -2149,7 +2231,7 @@ function App() {
 
       return visible;
     },
-    [completeAgentRun]
+    [completeAgentRun, scheduleIdleCheck]
   );
 
   useEffect(() => {
@@ -2486,6 +2568,8 @@ function App() {
       echoDisplayed: false,
       armed: false,
       notified: false,
+      waitingNotified: false,
+      outputTail: "",
     });
     stopBlinkingPane(paneId);
 
@@ -2550,6 +2634,8 @@ function App() {
           echoDisplayed: false,
           armed: true,
           notified: false,
+          waitingNotified: false,
+          outputTail: "",
         });
 
         const waitPromise = waitForAgentToken(token);
@@ -4216,16 +4302,19 @@ function App() {
         >
           {agentToasts.map((toast) => {
             const warning = toast.status === "warning";
+            const waiting = toast.status === "waiting";
             return (
               <div key={toast.id} className={`agent-toast ${toast.status}`}>
                 <div className="agent-toast-main">
                   <span className="agent-toast-title">
-                    {toast.label} finished
+                    {toast.label} {waiting ? "is waiting" : "finished"}
                   </span>
                   <span className="agent-toast-meta">
-                    {toast.sessionName} - {warning
-                      ? `exited with code ${toast.exitCode}`
-                      : "ready for review"}
+                    {toast.sessionName} - {waiting
+                      ? "may need your input"
+                      : warning
+                        ? `exited with code ${toast.exitCode}`
+                        : "ready for review"}
                   </span>
                 </div>
                 <button
